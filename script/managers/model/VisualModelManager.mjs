@@ -179,4 +179,8 @@ export default class VisualModelManager {
     getModelJSON() {
         return this.#visualModel.toJSON();
     }
+
+    restoreModel(json) {
+        this.#visualModel = VisualRDLTModel.fromJSON(json);
+    }
 }

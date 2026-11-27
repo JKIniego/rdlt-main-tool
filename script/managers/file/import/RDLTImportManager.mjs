@@ -12,9 +12,10 @@ import { parseNextBoolean, parseNextNamedArg, parseNextNamedArgList, parseNextNu
 export default class RDLTImportManager {
     /**
      * @param {string} raw 
+     * @param {string} name
      * @returns {VisualRDLTModel}
      */
-    static loadRDLTModel(raw) {
+    static loadRDLTModel(raw, name) {
         const parsed = parseRDLTFileToJSON(raw);
 
         /**
@@ -129,7 +130,7 @@ export default class RDLTImportManager {
         }
 
         return new VisualRDLTModel({
-            components: vertices, arcs
+            name, components: vertices, arcs
         });
     }
 }

@@ -16,6 +16,9 @@ export class GlobalKeyEventsManager {
         [ "Control", "=" ],
         [ "Control", "-" ],
         [ "Control", "d" ],
+        [ "Control", "z" ],
+        [ "Control", "y" ],
+        [ "Control", "Shift", "z" ],
     ];
 
     static initialize() {
@@ -25,7 +28,8 @@ export class GlobalKeyEventsManager {
                 return;
             }
 
-            GlobalKeyEventsManager.#heldKeys.add(event.key);
+            const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+            GlobalKeyEventsManager.#heldKeys.add(key);
             GlobalKeyEventsManager.#notifyListeners();
 
             if(GlobalKeyEventsManager.overridenKeys.some(
@@ -41,7 +45,8 @@ export class GlobalKeyEventsManager {
                 return;
             }
 
-            GlobalKeyEventsManager.#heldKeys.delete(event.key);
+            const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+            GlobalKeyEventsManager.#heldKeys.delete(key);
             GlobalKeyEventsManager.#notifyListeners();
         });
     }

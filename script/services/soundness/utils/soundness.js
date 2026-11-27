@@ -7,6 +7,10 @@ import { TestJoins } from './joins.mjs';
 import { Matrix } from './matrix.mjs';
 import { ActivityProfile } from '../models/ActivityProfile.js';
 import { Activity } from '../models/Activity.js';
+import { CASExtractor } from './cas-extractor.js';
+import { GeneralizedImpedance } from './generalized-impedance.js';
+import { generateTotalContractionPath } from './total-contraction-path.mjs';
+import { buildSplitJoinPairs, determineKmax, getKmaxJoinTypes } from './kmax-helper.mjs';
 
 /**
 * Utility class for verifying soundness properties.
@@ -21,7 +25,8 @@ export class Soundness {
     */
     static checkRelaxedSound(graph, evsa) {
 
-        const livenessViolations = [], weakenedPTViolations = [];
+        const livenessViolations = [], weakenedPTViolations = [], criteria = [];;
+        let level = 1; // Initialize level for the EVSA
         for(const rdlt of evsa) {
             // Clear activity profiles array of the graph object
             rdlt.activityProfiles = [];
@@ -38,7 +43,7 @@ export class Soundness {
             const activities = new Set();
 
             // Undergo activity extraction to get all cases
-            for (let i = 0; i < 20; i++) {
+            for (let i = 0; i < 50; i++) {
                 const activityProfile = rdlt.extractActivityProfile(source.id, sink.id);
 
                 // Serialize the activities array for uniqueness
@@ -73,10 +78,39 @@ export class Soundness {
             // Check for liveness
             const liveness = SoundnessCriteria.hasLiveness(rdlt.activityProfile, rdlt.vertices);
             
-            if (!(weakenedProperTermination.pass && liveness.pass)){
-                livenessViolations.push(...liveness.violations);
-                weakenedPTViolations.push(...weakenedProperTermination.violations);
+            if (!(weakenedProperTermination.pass && liveness.pass)) {
+                // Add level information to liveness violations
+                liveness.violations.forEach(violation => {
+                    livenessViolations.push({
+                        ...violation,
+                        level: `L${level}` // Add the level information
+                    });
+                });
+
+                // Add level information to weakened proper termination violations
+                weakenedProperTermination.violations.forEach(violation => {
+                    weakenedPTViolations.push({
+                        ...violation,
+                        level: `L${level}` // Add the level information
+                    });
+                });
             }
+
+            criteria.push({
+                pass: weakenedProperTermination.pass,
+                description: weakenedProperTermination.pass ? 
+                `Weakened Proper Termination (L${level}): Satisfied` :
+                `Weakened Proper Termination (L${level}): Not Satisfied`
+            });
+
+            criteria.push({
+                pass: liveness.pass,
+                description: liveness.pass ? 
+                `Liveness (L${level}): Satisfied` :
+                `Liveness (L${level}): Not Satisfied`
+            });
+
+            level++;
         }
 
         if(weakenedPTViolations.length > 0 || livenessViolations.length > 0){
@@ -92,15 +126,16 @@ export class Soundness {
                     {   
                         pass: !(weakenedPTViolations.length > 0),
                         description: weakenedPTViolations.length > 0 
-                        ? "Weakened Proper Termination: Not Satisfied" 
-                        : "Weakened Proper Termination: Satisfied"
+                        ? "Weakened Proper Termination (R): Not Satisfied" 
+                        : "Weakened Proper Termination (R): Satisfied"
                     },
                     {   
                         pass: !(livenessViolations.length > 0),
                         description: livenessViolations.length > 0 
-                        ? "Liveness: Not Satisfied" 
-                        : "Liveness: Satisfied"
-                    }
+                        ? "Liveness (R): Not Satisfied" 
+                        : "Liveness (R): Satisfied"
+                    },
+                    ...criteria
                 ]
             };
         }
@@ -108,7 +143,18 @@ export class Soundness {
             return {
                 pass: true, 
                 message: "The model is Relaxed Sound",
-                description: "The given RDLT satisfied relaxed soundness checks. Therefore it is relaxed sound."
+                description: "The given RDLT satisfied relaxed soundness checks. Therefore it is relaxed sound.",
+                criteria:[
+                    {   
+                        pass: true,
+                        description: "Weakened Proper Termination (R): Satisfied"
+                    },
+                    {   
+                        pass: true,
+                        description: "Liveness (R): Satisfied"
+                    },
+                    ...criteria
+                ]
             };
         }
     }
@@ -172,15 +218,27 @@ export class Soundness {
                     criteria: [
                         {   
                             pass: true,
-                            description: "JOIN-Safeness: Satisfied"
+                            description: "JOIN-Safeness (R): Satisfied"
                         },
                         {   
                             pass: true,
-                            description: "LOOP-Safeness: Satisfied" 
+                            description: "LOOP-Safeness (R): Satisfied" 
                         },
                         {   
                             pass: true,
-                            description: "Safeness: Satisfied" 
+                            description: "Safeness (R): Satisfied" 
+                        },
+                        {   
+                            pass: true,
+                            description: "JOIN-Safeness (L1): Satisfied"
+                        },
+                        {   
+                            pass: true,
+                            description: "LOOP-Safeness (L1): Satisfied" 
+                        },
+                        {   
+                            pass: true,
+                            description: "Safeness (L1): Satisfied" 
                         }
                     ]
                 };
@@ -199,20 +257,38 @@ export class Soundness {
                         {   
                             pass: matrixInstance.checkIfAllPositive("join"),
                             description: matrixInstance.checkIfAllPositive("join") 
-                            ? "JOIN-Safeness: Satisfied" 
-                            : "JOIN-Safeness: Not Satisfied"
+                            ? "JOIN-Safeness (R): Satisfied" 
+                            : "JOIN-Safeness (R): Not Satisfied"
                         },
                         {   
                             pass: matrixInstance.checkIfAllPositive("loop"),
                             description: matrixInstance.checkIfAllPositive("loop")
-                            ? "LOOP-Safeness: Satisfied" 
-                            : "LOOP-Safeness: Not Satisfied"
+                            ? "LOOP-Safeness (R): Satisfied" 
+                            : "LOOP-Safeness (R): Not Satisfied"
                         },
                         {   
                             pass: matrixInstance.checkIfAllPositive("safe"),
                             description: matrixInstance.checkIfAllPositive("safe")
-                            ? "Safeness: Satisfied" 
-                            : "Safeness: Not Satisfied"
+                            ? "Safeness (R): Satisfied" 
+                            : "Safeness (R): Not Satisfied"
+                        },
+                        {   
+                            pass: matrixInstance.checkIfAllPositive("join"),
+                            description: matrixInstance.checkIfAllPositive("join") 
+                            ? "JOIN-Safeness (L1): Satisfied" 
+                            : "JOIN-Safeness (L1): Not Satisfied"
+                        },
+                        {   
+                            pass: matrixInstance.checkIfAllPositive("loop"),
+                            description: matrixInstance.checkIfAllPositive("loop")
+                            ? "LOOP-Safeness (L1): Satisfied" 
+                            : "LOOP-Safeness (L1): Not Satisfied"
+                        },
+                        {   
+                            pass: matrixInstance.checkIfAllPositive("safe"),
+                            description: matrixInstance.checkIfAllPositive("safe")
+                            ? "Safeness (L1): Satisfied" 
+                            : "Safeness (L1): Not Satisfied"
                         }
                     ]
                 };
@@ -221,13 +297,13 @@ export class Soundness {
         else{
             console.log("RDLT contains other JOINs. Evaluating both R1 and R2");
             
-            const matrixInstance = new Matrix([R1, R2], cycleListR1);
+            const matrixInstance = new Matrix([...R1, ...R2], cycleListR1);
             
             // Perform matrix operations to determine L-safeness
             let l_safe_vector, matrix;
             ({ l_safe_vector, matrix } = matrixInstance.evaluateLSafeness());
                         
-            console.log(`Matrix evaluation result: (R1 only): ${l_safe_vector === true ? 'RDLT is L-Safe' : 'RDLT is not L-Safe'}`);
+            console.log(`Matrix evaluation result: (R1 and R2): ${l_safe_vector === true ? 'RDLT is L-Safe' : 'RDLT is not L-Safe'}`);
             
             if(l_safe_vector){
                 console.log("RDLT is CLASSICAL SOUND");
@@ -238,15 +314,27 @@ export class Soundness {
                     criteria: [
                         {   
                             pass: true,
-                            description: "JOIN-Safeness: Satisfied"
+                            description: "JOIN-Safeness (R): Satisfied"
                         },
                         {   
                             pass: true,
-                            description: "LOOP-Safeness: Satisfied" 
+                            description: "LOOP-Safeness (R): Satisfied" 
                         },
                         {   
                             pass: true,
-                            description: "Safeness: Satisfied" 
+                            description: "Safeness (R): Satisfied" 
+                        },
+                        {   
+                            pass: true,
+                            description: "JOIN-Safeness (L1 & L2): Satisfied"
+                        },
+                        {   
+                            pass: true,
+                            description: "LOOP-Safeness (L1 & L2): Satisfied" 
+                        },
+                        {   
+                            pass: true,
+                            description: "Safeness (L1 & L2): Satisfied" 
                         }
                     ]
                 };
@@ -265,20 +353,38 @@ export class Soundness {
                         {   
                             pass: matrixInstance.checkIfAllPositive("join"),
                             description: matrixInstance.checkIfAllPositive("join") 
-                            ? "JOIN-Safeness: Satisfied" 
-                            : "JOIN-Safeness: Not Satisfied"
+                            ? "JOIN-Safeness (R): Satisfied" 
+                            : "JOIN-Safeness (R): Not Satisfied"
                         },
                         {   
                             pass: matrixInstance.checkIfAllPositive("loop"),
                             description: matrixInstance.checkIfAllPositive("loop")
-                            ? "LOOP-Safeness: Satisfied" 
-                            : "LOOP-Safeness: Not Satisfied"
+                            ? "LOOP-Safeness (R): Satisfied" 
+                            : "LOOP-Safeness (R): Not Satisfied"
                         },
                         {   
                             pass: matrixInstance.checkIfAllPositive("safe"),
                             description: matrixInstance.checkIfAllPositive("safe")
-                            ? "Safeness: Satisfied" 
-                            : "Safeness: Not Satisfied"
+                            ? "Safeness (R): Satisfied" 
+                            : "Safeness (R): Not Satisfied"
+                        },
+                        {   
+                            pass: matrixInstance.checkIfAllPositive("join"),
+                            description: matrixInstance.checkIfAllPositive("join") 
+                            ? "JOIN-Safeness (L1 & L2): Satisfied" 
+                            : "JOIN-Safeness (L1 & L2): Not Satisfied"
+                        },
+                        {   
+                            pass: matrixInstance.checkIfAllPositive("loop"),
+                            description: matrixInstance.checkIfAllPositive("loop")
+                            ? "LOOP-Safeness (L1 & L2): Satisfied" 
+                            : "LOOP-Safeness (L1 & L2): Not Satisfied"
+                        },
+                        {   
+                            pass: matrixInstance.checkIfAllPositive("safe"),
+                            description: matrixInstance.checkIfAllPositive("safe")
+                            ? "Safeness (L1 & L2): Satisfied" 
+                            : "Safeness (L1 & L2): Not Satisfied"
                         }
                     ]
                 };
@@ -306,6 +412,8 @@ export class Soundness {
     static checkEasySound(graph, evsa) {
         console.log("received evsa", evsa); // Debug: Check the received evsa
 
+        let level = 1;
+        const criteria = [], violations = []; // Store criteria details per level
         for (const rdlt of evsa) {
             // Get the source and sink vertices for the current RDLT
             const { source, sink } = utils.getSourceAndSinkVertices(rdlt);
@@ -328,19 +436,18 @@ export class Soundness {
 
             // Check if the contracted RDLT has a contraction path from the source to the sink
             for (const vertex of contractedRDLT.vertices) {
-                // Split the vertex ID by the underscore to get the merged vertex components (if there are any)
                 const mergedVertexIds = vertex.id.split('_');
 
                 // Add all reachable vertices to the set
-                if(mergedVertexIds.includes(source.id)){
+                if (mergedVertexIds.includes(source.id)) {
                     mergedVertexIds.forEach(id => reachableVertices.add(id));
                 }
 
                 // Check if both the source and sink IDs are present in the merged vertex components
                 if (mergedVertexIds.includes(source.id) && mergedVertexIds.includes(sink.id)) {
-                    console.log(`There is a contraction path from ${source.id} to ${sink.id} in the contracted RDLT.`); // Debug: Path found
-                    rdltClear = true; // Set the flag to true if a path is found
-                    break; // Exit the loop if a path is found
+                    console.log(`There is a contraction path from ${source.id} to ${sink.id} in the contracted RDLT.`);
+                    rdltClear = true;
+                    break;
                 }
             }
 
@@ -353,35 +460,56 @@ export class Soundness {
 
             // If no contraction path is found, return the blocking vertices as violations
             if (!rdltClear) {
-                return {
+                violations.push(...blockingVertices.map(vertex => ({
+                    id: vertex.id,
+                    level: `L${level}` // Append level to the message
+                })));
+
+                criteria.push({
                     pass: false,
-                    message: "Easy Soundness Check was inconclusive",
-                    description: "There was no contraction path from the source to the sink. Therefore, further verification is needed to verify easy soundness.",
-                    violations: blockingVertices.map(vertex => ({
-                        id: vertex.id,
-                    })),
-                    criteria: [
-                        {   
-                            pass: false, 
-                            description: "Contraction Path From Source to Sink: Not Satisfied" 
-                        }
-                    ]
-                }; // If no contraction path is found in the RDLT, return false
+                    description: `Contraction Path From Source to Sink (L${level}): Not Satisfied`
+                });
             }
+            else{
+                criteria.push({
+                    pass: true,
+                    description: `Contraction Path From Source to Sink (L${level}): Satisfied`
+                });
+            }
+
+            level++; // Increment the level for the next EVSA
         }
 
-        return {
-            pass: true,
-            message: "The model is Easy Sound",
-            description: "A contraction path from the source to the sink was found. Therefore, the given RDLT is easy sound.",
-            violations: [],
-            criteria: [
-                {   
-                    pass: true, 
-                    description: "Contraction Path From Source to Sink: Satisfied" 
-                }
-            ]
-        }; // Return true if all RDLTs have a contraction path
+        if(violations.length > 0){
+            return {
+                pass: false,
+                message: "Easy Soundness Check was inconclusive",
+                description: "There was no contraction path from the source to the sink. Therefore, further verification is needed to verify easy soundness.",
+                violations,
+                criteria: [
+                    {
+                        pass: false, 
+                        description: "Contraction Path From Source to Sink (R): Satisfied" 
+                    },
+                    ...criteria
+                ]
+            }; // Return true if all RDLTs have a contraction path
+        }
+        else{
+            return {
+                pass: true,
+                message: "The model is Easy Sound",
+                description: "A contraction path from the source to the sink was found. Therefore, the given RDLT is easy sound.",
+                violations: [],
+                criteria: [
+                    {   
+                        pass: true, 
+                        description: "Contraction Path From Source to Sink (R): Satisfied" 
+                    },
+                    ...criteria
+                ]
+            }; // Return true if all RDLTs have a contraction path
+        }
     }
     
     /** 
@@ -402,84 +530,914 @@ export class Soundness {
     * - `violations` (optional): if the RDLT failed weak soundness check, this field contains an array of violation details
     */
     static checkWeakSound(graph, evsa, matrixInput) {
-        const violations = [];
+        const violations = []; // Store violation details, messages, and types
+        const criteria = []; // Store criteria details per level
 
         // Pre-processing for Asoy's matrix operations
         const cycleR1 = new Cycle(matrixInput.R1); // Cycle detection for R1
-        
-        //Evaluate the cycle; will populate Cycle_List
-        cycleR1.evaluateCycle();
-        
+        cycleR1.evaluateCycle(); // Evaluate the cycle
         const cycleListR1 = cycleR1.cycleList; // Get the cycle list for R1
-        
+
         // Evaluate JOIN conditions and determine the appropriate matrix operations
         console.log("Testing joins in RBS...");
         const check = TestJoins.checkSimilarTargetVertexAndUpdate(matrixInput.R1, matrixInput.R2);
 
-        let safeCA_loopSafeNCA;
-        if(check){
+        // Check for safe CA and loop-safe NCA
+        let safeCA_loopSafeNCA = true, matrixViolations = [];
+        if (check) {
             console.log("All are OR-JOINs, using only R1 data.");
-            
-            // Convert to matrix representation of Asoy
             const matrixInstance = new Matrix(matrixInput.R1, cycleListR1);
+            const { pass } = matrixInstance.evaluateSafeLoopSafe();
+            if (!pass){
+                safeCA_loopSafeNCA = false;
+                matrixViolations = matrixInstance.getSafeLoopSafeViolations();
+                criteria.push({
+                    pass: false,
+                    description: "Safe CA and Loop-Safe NCA (L1): Not Satisfied"
+                });
+            }
+            else{
+                criteria.push({
+                    pass: true,
+                    description: "Safe CA and Loop-Safe NCA (L1): Satisfied"
+                });
+            }
+        } else {
+            console.log("RDLT contains other JOINs. Evaluating both R1 and R2");
+            const matrixInstance = new Matrix([matrixInput.R1, matrixInput.R2], cycleListR1);
+            const { pass } = matrixInstance.evaluateSafeLoopSafe();
             
-            let pass, matrix;
-            // Perform matrix evaluation to determine L-safeness
-            ({ pass, matrix } = matrixInstance.evaluateSafeLoopSafe());
-            
-            console.log(`Matrix evaluation result: (R1 only): ${pass === true ? 'NCAs are loop-safe and CAs are safe' : 'NCAs are not loop-safe or CAs are not safe'}`);
-            console.log(`Generated Matrix`);
-            console.log("|  Arc  |   |x|   |y|  |l|  |c||eRU||cv| |op|  |cycle| |loop||out| |safe|");
-            matrixInstance.printMatrix();
-            console.log("-".repeat(60));
-            
-            // Print result for L-safeness
-            safeCA_loopSafeNCA = false;
+            if (!pass){
+                safeCA_loopSafeNCA = false;
+                matrixViolations = matrixInstance.getSafeLoopSafeViolations();
+                criteria.push({
+                    pass: false,
+                    description: "Safe CA and Loop-Safe NCA (L1 & L2): Not Satisfied"
+                });
+            }
+            else{
+                criteria.push({
+                    pass: false,
+                    description: "Safe CA and Loop-Safe NCA (L1 & L2): Satisfied"
+                });
+            }
         }
 
-        let deadlockResolving, alldeadlockResolving = true;
-        for(const rdlt of evsa){
-            // Get the source and sink vertices for the current RDLT
+        if (matrixViolations.length > 0) {
+            console.log("Formatting matrix violations...");
+            matrixViolations.forEach(violation => {
+                // Determine the level based on the r-id
+                const level = violation['r-id'].startsWith("R1") ? "L1" : "L2";
+
+                // Append the level to the message
+                violations.push({
+                    id: violation.arc, // Map the "arc" field to the "id"
+                    message: `${violation.type} (${level})`, // Append the level to the type
+                    type: "asoy-edge"
+                });
+            });
+        }
+
+        // Checking for deadlock resolving
+        let alldeadlockResolving = true, weakenedJoinSafe = true;
+        let deadlockPoints = [], reachedVertices = [], level = 1;
+        for (const rdlt of evsa) {
             const { source, sink } = utils.getSourceAndSinkVertices(rdlt);
-            
             if (!source || !sink) {
                 console.warn("Source or sink vertex not found in the graph.");
-                return false; // If either source or sink is missing, the graph is not easy sound
+                return false;
             }
 
-            // console.log(`Source: ${source.id}, Sink: ${sink.id}`); // Debug: Log source and sink
-
-            const {deadlockPoints, reachedVertices} = GraphOperations.gatherDeadlockPoints(rdlt, source);
-            
-            // console.log("Deadlock points: ", deadlockPoints);
-
-            // Check for deadlock resolving
-            deadlockResolving = SoundnessCriteria.isDeadlockResolving(rdlt, deadlockPoints, reachedVertices, sink);
-            console.log("Deadlock resolving result: ", deadlockResolving);
-            if(!deadlockResolving.pass){
+            ({ deadlockPoints, reachedVertices } = GraphOperations.gatherDeadlockPoints(rdlt, source));
+            const deadlockResolving = SoundnessCriteria.isDeadlockResolving(rdlt, deadlockPoints, reachedVertices, sink);
+            if (!deadlockResolving.pass) {
                 alldeadlockResolving = false;
-                violations.push([...deadlockResolving.violations]);
+                deadlockResolving.violations.forEach(violation => {
+                    violations.push({
+                        id: violation.id,
+                        message: `${violation.message} (L${level})`, // Append level to the message
+                        type: "vertex"
+                    });
+                });
+
+                criteria.push({
+                    pass: false,
+                    description: `Deadlock-Resolving (L${level}): Not Satisfied` // Append level to the description
+                })
             }
+            else{
+                criteria.push({
+                    pass: true,
+                    description: `Deadlock-Resolving (L${level}): Satisfied` // Append level to the description
+                })
+            }
+
+            // Checking for Weakened JOIN-Safe L values
+            console.log("Checking weakened join l-safe for deadlock points: ", deadlockPoints);
+            for (const deadlock of deadlockPoints) {
+                const incomingArcs = rdlt.edges.filter(edge => edge.to.id === deadlock.id);
+                let weakenedJoinSafeForThisDeadlock = true; // Track if weakened JOIN-safe L-values are satisfied for this deadlock
+
+                if (incomingArcs.length !== 2) {
+                    weakenedJoinSafeForThisDeadlock = false;
+                    violations.push({
+                        id: deadlock.id,
+                        message: `Deadlock point does not have exactly two incoming arcs. (L${level})`, // Append level
+                        type: "vertex"
+                    });
+                } else {
+                    const joinVertex1 = incomingArcs[0].from;
+                    const joinVertex2 = incomingArcs[1].from;
+
+                    // Criterion 1: Shared split origin
+                    const splitOrigin = GraphOperations.findUniqueSplitOrigin(rdlt, joinVertex1, joinVertex2, deadlock);
+                    if (splitOrigin === null) {
+                        weakenedJoinSafeForThisDeadlock = false;
+                        violations.push({
+                            id: deadlock.id,
+                            message: `No shared split origin found for the deadlock point. (L${level})`, // Append level
+                            type: "vertex"
+                        });
+                    } else {
+                        const pathU = GraphOperations.findSimplePath(rdlt, splitOrigin, joinVertex1);
+                        const pathV = GraphOperations.findSimplePath(rdlt, splitOrigin, joinVertex2);
+
+                        if (!pathU) {
+                            weakenedJoinSafeForThisDeadlock = false;
+                            violations.push({
+                                id: joinVertex1.id,
+                                message: `No unique simple path found from split origin to join vertex. (L${level})`, // Append level
+                                type: "vertex"
+                            });
+                        } else {
+                            pathU.push(deadlock);
+                        }
+
+                        if (!pathV) {
+                            weakenedJoinSafeForThisDeadlock = false;
+                            violations.push({
+                                id: joinVertex2.id,
+                                message: `No unique simple path found from split origin to join vertex. (L${level})`, // Append level
+                                type: "vertex"
+                            });
+                        } else {
+                            pathV.push(deadlock);
+                        }
+
+                        // Criterion 2: No Unrelated Processes
+                        if (pathU && pathV && (!GraphOperations.noInterruptions(rdlt, pathU) || !GraphOperations.noInterruptions(rdlt, pathV))) {
+                            weakenedJoinSafeForThisDeadlock = false;
+                            violations.push({
+                                id: deadlock.id,
+                                message: `Unrelated processes detected on one or both paths. (L${level})`, // Append level
+                                type: "vertex"
+                            });
+                        }
+
+                        // Criterion 3: No branching out
+                        if (pathU && pathV && (!GraphOperations.noBranchingOut(rdlt, pathU) || !GraphOperations.noBranchingOut(rdlt, pathV))) {
+                            weakenedJoinSafeForThisDeadlock = false;
+                            violations.push({
+                                id: deadlock.id,
+                                message: `Branching out detected on one or both paths. (L${level})`, // Append level
+                                type: "vertex"
+                            });
+                        }
+
+                        // Criterion 5: Duplicate Values
+                        if (incomingArcs[0].constraint !== "" && incomingArcs[1].constraint !== "") {
+                            const checkDuplicateConditions = GraphOperations.checkDuplicateValues(incomingArcs[0], incomingArcs[1], rdlt);
+                            if (!checkDuplicateConditions.pass) {
+                                weakenedJoinSafeForThisDeadlock = false;
+                                for (const violation of checkDuplicateConditions.violations) {
+                                    violations.push({
+                                        id: `${violation.from}, ${violation.to}`,
+                                        message: `Duplicate constraint values not satisfied. (L${level})`, // Append level
+                                        type: "edge"
+                                    });
+                                }
+                            }
+                        }
+
+                        // Criterion 6: AND-Join L-Value Match
+                        if (incomingArcs[0].constraint !== "" && incomingArcs[1].constraint !== "") {
+                            if (incomingArcs[0].maxTraversals !== incomingArcs[1].maxTraversals) {
+                                weakenedJoinSafeForThisDeadlock = false;
+                                violations.push({
+                                    id: `${incomingArcs[0].from.id}, ${incomingArcs[0].to.id}`,
+                                    message: `L-values for AND-Join do not match. (L${level})`, // Append level
+                                    type: "edge"
+                                }, {
+                                    id: `${incomingArcs[1].from.id}, ${incomingArcs[1].to.id}`,
+                                    message: `L-values for AND-Join do not match. (L${level})`, // Append level
+                                    type: "edge"
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Add to criteria if weakened JOIN-safe L-values are not satisfied for this deadlock
+                if (!weakenedJoinSafeForThisDeadlock) {
+                    weakenedJoinSafe = false;
+                    criteria.push({
+                        pass: false,
+                        description: `Weakened JOIN-Safe L-Values (L${level}): Not Satisfied` // Append level to the description
+                    });
+                }
+                else{
+                    criteria.push({
+                        pass: true,
+                        description: `Weakened JOIN-Safe L-Values (L${level}): Satisfied` // Append level to the description
+                    });
+                }
+            }
+            level++;
         }
 
         let pass, message, description;
-        // Format outputs
-        if( alldeadlockResolving && safeCA_loopSafeNCA){
+        if (alldeadlockResolving && safeCA_loopSafeNCA && weakenedJoinSafe) {
             pass = true;
             message = "The model is Weak Sound";
             description = "The given RDLT passed deadlock-tolerance checks. Therefore it is Weak Sound.";
-        }
-        else{
+        } else {
             pass = false;
-            message = "Weak sound verification is inconclusive",
-            description = "The given RDLT is did not pass deadlock-tolerance checks. Therefore more verification is needed."
+            message = "Weak sound verification is inconclusive";
+            description = "The given RDLT did not pass deadlock-tolerance checks. Therefore more verification is needed.";
         }
-
+        console.log("Violations: ", violations);
         return {
             pass,
             message,
             description,
+            criteria:[
+                {   
+                    pass: safeCA_loopSafeNCA,
+                    description: safeCA_loopSafeNCA
+                            ? "Safe CA and Loop-Safe NCA (R): Satisfied" 
+                            : "Safe CA and Loop-Safe NCA (R): Not Satisfied"
+                },
+                {   
+                    pass: alldeadlockResolving,
+                    description: alldeadlockResolving
+                            ? "Deadlock-Resolving (R): Satisfied" 
+                            : "Deadlock-Resolving (R): Not Satisfied"
+                },
+                {   
+                    pass: weakenedJoinSafe,
+                    description: weakenedJoinSafe
+                            ? "Weakened JOIN-Safe L-Values (R): Satisfied" 
+                            : "Weakened JOIN-Safe L-Values (R): Not Satisfied"
+                },
+                ...criteria
+            ],
             violations
+        };
+    }
+
+    /**
+     * Verifies the lazy soundness property of an RDLT by checking the two
+     * formal conditions from Definition 1.24:
+     *   1. Option to Complete  – at least one activity (CAS) reaches the sink.
+     *   2. Proper Termination (Weakened) – exactly one activity can complete;
+     *      verified operationally via Generalized Impedance when multiple CAS
+     *      exist, or trivially when only one CAS exists.
+     *
+     * The criteria array returned ALWAYS contains all three visible entries
+     * (Option to Complete, Proper Termination (Weakened), Generalized Impedance)
+     * so the UI can show every condition and its status regardless of outcome.
+     *
+     * @param {Graph} graph - The original RDLT.
+     * @param {Graph[]} evsa - Array containing [R1, R2, …] vertex-simplified RDLTs.
+     * @returns {{
+     *   pass: boolean,
+     *   message: string,
+     *   description: string,
+     *   violations: Array,
+     *   criteria: Array,
+     *   sharedArcs?: Array,
+     *   visualizationData: Object
+     * }}
+     */
+    static checkLazySound(graph, evsa) {
+        console.log("Starting lazy soundness verification...");
+
+        const violations = [];
+
+        // --------------- visualization data shell ---------------
+        const visualizationData = {
+            originalRDLT: graph,
+            R1: null,
+            R2: null,
+            source: null,
+            sink: null,
+            masR1: [],
+            masR2: [],
+            casSet: [],
+            impedanceResult: null,
+            finalResult: null
+        };
+
+        // --------------- source / sink ---------------
+        const { source, sink } = utils.getSourceAndSinkVertices(graph);
+        visualizationData.source = source;
+        visualizationData.sink = sink;
+
+        if (!source || !sink) {
+            // Cannot even begin – surface all three conditions as failed
+            visualizationData.finalResult = {
+                pass: false,
+                message: "Lazy Soundness Check Failed",
+                description: "Source or sink vertex not found."
+            };
+
+            return {
+                pass: false,
+                message: "Lazy Soundness Check Failed",
+                description: "Source or sink vertex not found.",
+                violations: [],
+                criteria: [
+                    { pass: false, description: "Option to Complete: Not Satisfied" },
+                    { pass: false, description: "Proper Termination (Weakened): Not Satisfied" },
+                    { pass: false, description: "Generalized Impedance: Not Satisfied" }
+                ],
+                visualizationData
+            };
+        }
+
+        // --------------- build R1 / R2 ---------------
+        const R1 = evsa[0];
+        let R2 = null;
+        if (evsa.length > 1) {
+            R2 = new Graph();
+            for (let i = 1; i < evsa.length; i++) {
+                const r2i = evsa[i];
+                if (r2i && r2i.vertices) {
+                    r2i.vertices.forEach(v => {
+                        if (!R2.vertices.some(existing => existing.id === v.id)) {
+                            R2.addVertex(v);
+                        }
+                    });
+                }
+                if (r2i && r2i.edges) {
+                    r2i.edges.forEach(e => {
+                        if (!R2.edges.some(existing => existing.from.id === e.from.id && existing.to.id === e.to.id)) {
+                            R2.addEdge(e);
+                        }
+                    });
+                }
+            }
+        }
+        visualizationData.R1 = R1;
+        visualizationData.R2 = R2;
+
+        // --------------- contraction path gate (Option to Complete) ---------------
+        // Before extracting MAS/CAS, verify that a contraction path from source to
+        // sink actually exists at every EVSA level.  The MAS extractor uses pure
+        // DFS which ignores C-attribute constraints; a model whose OR-join is
+        // blocked by unsatisfied C-conditions would produce phantom paths that are
+        // not executable activities.  This gate uses the same contraction strategy
+        // as Easy Soundness (GraphOperations.contractGraph) to prevent false
+        // positives.
+        let contractionPathExists = true;
+        const contractionFailedLevels = [];
+        const contractionBlockingVertices = [];
+
+        for (let i = 0; i < evsa.length; i++) {
+            const rdlt = evsa[i];
+            const { source: levelSource, sink: levelSink } = utils.getSourceAndSinkVertices(rdlt);
+
+            if (!levelSource || !levelSink) {
+                contractionPathExists = false;
+                contractionFailedLevels.push(`L${i + 1}`);
+                continue;
+            }
+
+            const contractedRDLT = GraphOperations.contractGraph(rdlt, levelSource);
+            let pathFound = false;
+            const reachableVertices = new Set();
+
+            for (const vertex of contractedRDLT.vertices) {
+                const mergedVertexIds = vertex.id.split('_');
+                if (mergedVertexIds.includes(levelSource.id)) {
+                    mergedVertexIds.forEach(id => reachableVertices.add(id));
+                }
+                if (mergedVertexIds.includes(levelSource.id) && mergedVertexIds.includes(levelSink.id)) {
+                    pathFound = true;
+                    break;
+                }
+            }
+
+            if (!pathFound) {
+                contractionPathExists = false;
+                contractionFailedLevels.push(`L${i + 1}`);
+
+                // Collect blocking vertices for violation reporting
+                for (const vertex of rdlt.vertices) {
+                    if (!reachableVertices.has(vertex.id) && vertex.id !== levelSink.id) {
+                        contractionBlockingVertices.push({
+                            id: vertex.id,
+                            level: `L${i + 1}`
+                        });
+                    }
+                }
+            }
+
+            console.log(`Contraction path check L${i + 1}: ${pathFound ? 'PASS' : 'FAIL'}`);
+        }
+
+        if (!contractionPathExists) {
+            // Short-circuit: no contraction path → Option to Complete fails.
+            // Do NOT proceed with MAS/CAS extraction (DFS would find phantom paths).
+            console.log(`Contraction path failed at level(s): ${contractionFailedLevels.join(', ')}`);
+
+            const failDescription = `No contraction path from source to sink at level(s) ${contractionFailedLevels.join(', ')}. ` +
+                `C-attribute constraints block reachability. No CAS generated therefore not lazy soundness.`;
+
+            violations.push({
+                type: "no-path",
+                message: failDescription,
+                vertices: contractionBlockingVertices.map(v => v.id)
+            });
+
+            visualizationData.finalResult = {
+                pass: false,
+                message: "Lazy Soundness Check Failed",
+                description: failDescription
+            };
+
+            return {
+                pass: false,
+                message: "Lazy Soundness Check Failed",
+                description: failDescription,
+                violations,
+                criteria: [
+                    { pass: false, description: "Option to Complete: Not Satisfied" },
+                    { pass: false, description: "Proper Termination (Weakened): Not Satisfied" },
+                    { pass: false, description: "Generalized Impedance: Not Applicable" }
+                ],
+                visualizationData
+            };
+        }
+
+        // --------------- extract CAS ---------------
+        console.log("Extracting Complete Activity Structures...");
+        const { casSet, masR1, masR2 } = CASExtractor.extractAllCASWithDetails(graph, R1, R2, source, sink);
+
+        visualizationData.masR1 = masR1;
+        visualizationData.masR2 = masR2;
+        visualizationData.casSet = casSet;
+        console.log(`Extracted ${casSet.length} CAS`);
+
+        // --------------- evaluate each formal condition ---------------
+
+        // --- Condition 1: Option to Complete ---
+        // Satisfied iff at least one CAS was extracted (sink is reachable).
+        const optionToComplete = casSet.length > 0;
+        console.log(`Option to Complete: ${optionToComplete}`);
+
+        // --- Condition 2 & 3: Proper Termination (Weakened) & Generalized Impedance ---
+        // These two are evaluated together because Generalized Impedance is the
+        // operational mechanism that guarantees Proper Termination when multiple
+        // CAS exist.  We still run (or deliberately skip) the impedance check in
+        // every branch so that the UI can show its status.
+        let properTerminationWeakened = false;   // exactly one activity can complete
+        let generalizedImpedance      = false;   // all CAS share an arc with L=1
+        let impedanceResult           = null;
+
+        if (casSet.length === 0) {
+            // No CAS at all – both downstream conditions trivially fail.
+            properTerminationWeakened = false;
+            generalizedImpedance      = false;
+            impedanceResult = {
+                pass: false,
+                sharedArcs: [],
+                violations: [{ type: "no-path", message: "No CAS exist – generalized impedance cannot be evaluated." }],
+                message: "Not applicable – no CAS extracted"
+            };
+
+            violations.push({
+                type: "no-path",
+                message: "Sink is unreachable from source",
+                vertices: []
+            });
+
+        } else if (casSet.length === 1) {
+            // Single CAS – proper termination is trivially satisfied because
+            // there is no competing activity.  Generalized impedance is also
+            // considered satisfied (vacuously true – no pair to impede).
+            console.log("Single CAS found – proper termination trivially satisfied.");
+            properTerminationWeakened = true;
+            generalizedImpedance      = true;   // vacuously true
+            impedanceResult = {
+                pass: true,
+                sharedArcs: [],
+                violations: [],
+                message: "Only one CAS exists – generalized impedance is vacuously satisfied"
+            };
+
+        } else {
+            // Multiple CAS – run generalized impedance check.
+            console.log(`Multiple CAS (${casSet.length}) found – checking generalized impedance`);
+            impedanceResult = GeneralizedImpedance.checkGeneralizedImpedance(casSet);
+            generalizedImpedance = impedanceResult.pass;
+
+            // Proper termination (weakened) holds iff generalized impedance holds,
+            // because the shared constrained arc (L=1) ensures only one activity
+            // can complete (Lemma 1.1 in the paper).
+            properTerminationWeakened = impedanceResult.pass;
+
+            if (!impedanceResult.pass) {
+                violations.push(...impedanceResult.violations);
+            }
+        }
+
+        visualizationData.impedanceResult = impedanceResult;
+
+        // --------------- assemble the overall result ---------------
+        const overallPass = optionToComplete && properTerminationWeakened;
+
+        // The criteria array always contains all three formal conditions so the
+        // UI can show every one regardless of which path was taken.
+        const criteria = [
+            {
+                pass: optionToComplete,
+                description: optionToComplete
+                    ? "Option to Complete: Satisfied"
+                    : "Option to Complete: Not Satisfied"
+            },
+            {
+                pass: properTerminationWeakened,
+                description: properTerminationWeakened
+                    ? "Proper Termination (Weakened): Satisfied"
+                    : "Proper Termination (Weakened): Not Satisfied"
+            },
+            {
+                pass: generalizedImpedance,
+                description: generalizedImpedance
+                    ? "Generalized Impedance: Satisfied"
+                    : "Generalized Impedance: Not Satisfied"
+            }
+        ];
+
+        // --------------- build human-readable description ---------------
+        let description;
+        if (overallPass) {
+            if (casSet.length === 1) {
+                description = "Exactly one Complete Activity Structure exists. Only one activity can complete.";
+            } else {
+                description = `All ${casSet.length} Complete Activity Structures share a common constrained resource (L=1). Only one activity can complete.`;
+            }
+        } else {
+            // Enumerate which conditions failed for a clear diagnostic.
+            const failedConditions = [];
+            if (!optionToComplete)            failedConditions.push("Option to Complete");
+            if (!properTerminationWeakened)   failedConditions.push("Proper Termination (Weakened)");
+            if (!generalizedImpedance && casSet.length > 1) failedConditions.push("Generalized Impedance");
+
+            if (casSet.length === 0) {
+                description = "No Complete Activity Structure found. The sink is unreachable from the source.";
+            } else {
+                description = `Multiple Complete Activity Structures exist but they do not exhibit generalized impedance. Multiple activities may be able to complete. Failed: ${failedConditions.join(", ")}.`;
+            }
+        }
+
+        visualizationData.finalResult = {
+            pass: overallPass,
+            message: overallPass ? "The model is Lazy Sound" : "Lazy Soundness Check Failed",
+            description
+        };
+
+        return {
+            pass: overallPass,
+            message: overallPass ? "The model is Lazy Sound" : "Lazy Soundness Check Failed",
+            description,
+            violations,
+            sharedArcs: impedanceResult?.sharedArcs,
+            criteria,
+            visualizationData
+        };
+    }
+    
+    /**
+     * Verifies the kmax-soundness property of an RDLT by checking the three
+     * formal structural conditions for kmax-safeness (Definition 19 / Theorem 10):
+     *   1. Deadlock Tolerance (Weak Soundness) – verified via WRSVA (loop-safe NCAs,
+     *      safe CAs, weakened JOIN-safe L-values, and escape contraction paths).
+     *   2. Impedance-Free L-values – all arc reusability limits satisfy L(x, y) >= kmax.
+     *   3. kmax-Ensuring – for each EVSA graph with detected split-join pairs,
+     *      all split and join vertices in the entire RDLT are counted and checked against:
+     *      - Merging joins: Jm = ceil(|Esplit| / 2) - kmax + 1
+     *      - Separating joins: Js <= kmax - 1
+     *
+     * The criteria array includes a kmax-Ensuring result only for EVSA graphs
+     * with detected split-join pairs.
+     * 
+     * Join types are validated before the other checks; any join with more than
+     * two unique incoming constraints makes the kmax-soundness check inconclusive.
+     *
+     * 
+     * @param {Graph} graph - The original input RDLT R.
+     * @param {Graph[]} evsa - Array containing [R1, R2, ...] vertex-simplified RDLTs.
+     * @param {Object} matrixInput - the RDLT & EVSA representation objects in readable format for matrix operations of Asoy
+     * @returns {{
+     *   pass: boolean,
+     *   message: string,
+     *   description: string,
+     *   violations: Array,
+     *   criteria: Array,
+     *   kmaxEnsuringResults: Array,
+     *   visualizationData: Object
+     * }}
+     */
+    static checkkmaxSound(graph, evsa, matrixInput) {
+        const criteria = [];
+        const violations = [];
+        const kmaxEnsuringResults = [];
+        let level = 1;
+        const joinTypesByRdlt = new Map();
+        const joinTypeViolations = [];
+        evsa.forEach((rdlt, index) => {
+            const { joinTypes, invalidJoinIds } = getKmaxJoinTypes(rdlt);
+            joinTypesByRdlt.set(rdlt, joinTypes);
+            for (const vertexId of invalidJoinIds) {
+                joinTypeViolations.push({
+                    id: vertexId,
+                    type: "vertex",
+                    message: `Join type validation failed (L${index + 1}): vertex ${vertexId} has more than two unique incoming constraints.`
+                });
+            }
+        });
+
+        if (joinTypeViolations.length > 0) {
+            return {
+                pass: false,
+                message: "kᵐᵃˣ-soundness check was inconclusive",
+                description: "The kᵐᵃˣ-soundness check cannot be performed because one or more joins have more than two unique incoming constraints.",
+                criteria: [{
+                    pass: false,
+                    description: "Join type validation: Cannot check kᵐᵃˣ-soundness"
+                }],
+                violations: joinTypeViolations,
+                kmaxEnsuringResults
+            };
+        }
+
+        // The WRSVA verifies the weak-soundness property of an RDLT by checking
+        // for deadlock tolerance that ensures proper termination regardless of
+        // liveliness. Hence, it can be used to check for kmax-soundness of an RDLT.
+        const weakResult = Soundness.checkWeakSound(graph, evsa, matrixInput);
+        violations.push(...(weakResult.violations || []));
+        criteria.push({
+            pass: weakResult.pass,
+            description: weakResult.pass
+                ? "Weak Soundness: Satisfied"
+                : "Weak Soundness: Not Satisfied"
+        });
+
+        // Based on the pseudocode, it returns false the moment weak soundness check
+        // did not pass. Hence, it will return the violating components from the weak
+        // soundness module of Ejercito
+        if (!weakResult.pass) {
+            return {
+                ...weakResult,
+                message: `kᵐᵃˣ-soundness check was inconclusive`,
+                description: "The model does not satisfy all kᵐᵃˣ-soundness criteria.",
+                criteria,
+                violations,
+                kmaxEnsuringResults
+            };
+        }
+
+        const inputModel = matrixInput?.input_rdlt?.model;
+        const kmax = determineKmax(graph, inputModel);
+
+        console.log(`kmax = ${kmax}`);
+
+        for (const rdlt of evsa) {
+            const joinTypes = joinTypesByRdlt.get(rdlt);
+            let reason;
+
+            // Build the traversable RDLT from this EVSA's total contraction
+            // path. Both checks below must use the same path-restricted graph.
+            const rdltArcs = rdlt.edges;
+            const { source: rdltSource } = utils.getSourceAndSinkVertices(rdlt);
+            const contractedVertexIds = new Set();
+            if (!rdltSource) {
+                reason = "Unable to identify the RDLT source vertex.";
+            } else {
+                const { P_Total } = generateTotalContractionPath({
+                    vertices: rdlt.vertices,
+                    arcs: rdltArcs,
+                    source: rdltSource
+                });
+                for (const vertexId of P_Total) {
+                    contractedVertexIds.add(String(vertexId));
+                }
+            }
+
+            const traversableRdlt = {
+                vertices: rdlt.vertices.filter(vertex =>
+                    contractedVertexIds.has(String(vertex.id))
+                ),
+                edges: rdltArcs.filter(edge =>
+                    contractedVertexIds.has(String(edge.from.id)) &&
+                    contractedVertexIds.has(String(edge.to.id))
+                )
+            };
+
+            let isImpedanceFreeLValues = !reason;
+            if (reason) {
+                violations.push({
+                    id: null,
+                    type: "graph",
+                    message: `Impedance-free L-values could not be checked (L${level}): ${reason}`
+                });
+            }
+
+            // Implementation: the number of activities that can be initiated
+            // is kmax (the number of traversable outgoing arcs from the source
+            // s, computed above). Every traversable arc must therefore satisfy
+            //     L(x, y) >= kmax
+            // Any arc with kmax > L(x, y) would impede (block) one of the
+            // concurrently initiated activities from traversing it, so it is
+            // recorded as a violation.
+            for (const edge of traversableRdlt.edges) {
+                if (kmax > edge.maxTraversals) {
+                    isImpedanceFreeLValues = false;
+                    violations.push({
+                        id: `${edge.from.id}, ${edge.to.id}`,
+                        type: "edge",
+                        message: `Impedance-free L-values violation (L${level}): ${edge.from.id} → ${edge.to.id} has L=${edge.maxTraversals}, but kᵐᵃˣ requires at least ${kmax}.`
+                    });
+                }
+            }
+
+            // Criterion result: satisfied only if no arc violated L(x, y) >= kmax.
+            criteria.push({
+                pass: isImpedanceFreeLValues,
+                description: isImpedanceFreeLValues
+                    ? `Impedance-free L-values (L${level}): Satisfied`
+                    : `Impedance-free L-values (L${level}): Not satisfied`
+            });
+
+            // Before Jm, Js, and |Esplit| can be counted, we need to know:
+            //   (a) which vertices/arcs are traversable (collected above), and
+            //   (b) which vertices lie on cycles and which arcs are looping
+            //       arcs (splits with a looping arc are excluded from Esplit).
+            const traversableRdltArcs = traversableRdlt.edges;
+
+            // Detect all cycles in this EVSA graph. Each arc is mapped to the
+            // { "r-id", arc: "from, to" } format that the Cycle class expects,
+            // falling back to the array index when an edge has no id.
+            const rdltCycles = new Cycle(traversableRdltArcs.map((edge, index) => ({
+                "r-id": edge.id ?? index,
+                arc: `${edge.from.id}, ${edge.to.id}`
+            })));
+            const detectedCycles = rdltCycles.findCycles(rdltCycles.graph);
+            console.log("Detected Cycles:", detectedCycles);
+            
+            // Looping arcs: for each cycle, the last arc in the cycle is the
+            // one that closes the loop back to an earlier vertex, so it is
+            // treated as the looping arc. These keys ("from->to") are used to
+            // exclude such arcs from Esplit, per Definition 18 ("OR- and
+            // AND-splits that do not have a looping arc").
+            const loopingArcKeys = new Set(
+                detectedCycles
+                    .filter(cycle => cycle.length > 0)
+                    .map(cycle => {
+                        const [from, to] = cycle[cycle.length - 1];
+                        return `${String(from)}->${String(to)}`;
+                    })
+            );
+            console.log("Looping Arcs:", loopingArcKeys);
+
+
+            // An RDLT R is kmax-ensuring if, given:
+            //   - Jm: number of joins merging activities
+            //   - Js: number of joins separating activities
+            //   - Esplit: set of traversable arcs (x, y) ∈ E that form splits
+            //             separating activities, i.e., OR- and AND-splits that
+            //             do NOT have a looping arc
+            // the following constraints hold:
+            //   (1) Jm = ceil(|Esplit| / 2) - kmax + 1
+            //   (2) Js <= kmax - 1
+
+            // Split vertices (x) and their paired join vertices come from the
+            // sibling paths of the split-join pairs. Both are used below to
+            // identify the splits that make up Esplit and the joins to count
+            // for Jm and Js.
+            const { siblingPaths } = buildSplitJoinPairs(traversableRdlt);
+            const splitIds = new Set();
+            const pairedJoinIds = new Set();
+            for (const paths of siblingPaths.values()) {
+                for (const path of paths) {
+                    splitIds.add(String(path[0].id));
+                    pairedJoinIds.add(String(path[path.length - 1].id));
+                }
+            }
+
+            // No split-join pairs means there are no splits/joins to count, so
+            // Definition 18 does not apply to this EVSA graph. Skip it.
+            if (siblingPaths.size === 0) {
+                console.log(`L${level}: no split-join pairs detected; skipping kᵐᵃˣ-ensuring check.`);
+                level++;
+                continue;
+            }
+
+            const joinVertices = traversableRdlt.vertices.filter(vertex => {
+                const incomingArcs = traversableRdltArcs.filter(edge =>
+                    String(edge.to.id) === String(vertex.id)
+                );
+                return pairedJoinIds.has(String(vertex.id)) &&
+                    joinTypes.has(String(vertex.id)) &&
+                    incomingArcs.length > 1;
+            });
+            const joinVertexIds = new Set(joinVertices.map(vertex => String(vertex.id)));
+            const esplitArcs = traversableRdltArcs.filter(edge => {
+                const arcKey = `${String(edge.from.id)}->${String(edge.to.id)}`;
+                return splitIds.has(String(edge.from.id)) &&
+                    !loopingArcKeys.has(arcKey) &&
+                    !joinVertexIds.has(String(edge.to.id));
+            });
+            const esplits = esplitArcs.length;
+
+            // Classify each counted join by type:
+            //   Jm (merging activities) -> AND joins
+            //   Js (separating activities) -> OR / MIX joins
+            let mergingJoins = 0;
+            let separatingJoins = 0;
+            for (const joinVertex of joinVertices) {
+                const joinType = joinTypes.get(String(joinVertex.id));
+                if (joinType === "AND") mergingJoins++;
+                else if (joinType === "OR" || joinType === "MIX") separatingJoins++;
+            }
+
+            // Constraint (1): Jm = ceil(|Esplit| / 2) - kmax + 1
+            // i.e., the number of joins merging activities must equal the
+            // difference between the number of traversable arcs that separate
+            // activities and the number of initiated activities (kmax), plus one.
+            const expectedMergingJoins = Math.ceil(esplits / 2) - kmax + 1;
+
+            // Constraint (2): Js <= kmax - 1
+            // i.e., the number of joins that separate activities must equal the
+            // number of initiated activities minus one.
+            const maxSeparatingJoins = kmax - 1;
+
+            // The RDLT is kmax-ensuring (for this EVSA graph) only if both
+            // constraints of Definition 18 are satisfied.
+            const pass = mergingJoins === expectedMergingJoins &&
+                separatingJoins <= maxSeparatingJoins &&
+                !reason;
+            const result = {
+                level,
+                scope: "Entire RDLT",
+                vertices: [],
+                mergingJoins,
+                separatingJoins,
+                esplits,
+                esplitArcs: esplitArcs.map(edge => [edge.from.id, edge.to.id]),
+                expectedMergingJoins,
+                maxSeparatingJoins,
+                pass,
+                reason
+            };
+            kmaxEnsuringResults.push(result);
+
+            console.log(
+                `L${level} entire RDLT: ${pass ? "PASS" : "FAIL"}; ` +
+                `Esplits=${esplits}, Jm=${mergingJoins}/${expectedMergingJoins}, ` +
+                `Js=${separatingJoins}/${maxSeparatingJoins} maximum` +
+                (reason ? `; ${reason}` : "")
+            );
+
+            const isKmaxEnsuring = pass;
+            criteria.push({
+                pass: isKmaxEnsuring,
+                description: isKmaxEnsuring
+                    ? `kᵐᵃˣ-ensuring (L${level}): Satisfied`
+                    : `kᵐᵃˣ-ensuring (L${level}): Not satisfied`
+            });
+
+            level++;
+        }
+
+        const pass = criteria.every(criterion => criterion.pass) &&
+            kmaxEnsuringResults.every(result => result.pass);
+
+        return {
+            ...weakResult,
+            kmax,
+            pass,
+            message: pass
+                ? `The model is kᵐᵃˣ-sound (kᵐᵃˣ = ${kmax})`
+                : `kᵐᵃˣ-soundness check was inconclusive (kᵐᵃˣ = ${kmax})`,
+            description: pass
+                ? "The model satisfies all kᵐᵃˣ-soundness criteria."
+                : "The model does not satisfy all kᵐᵃˣ-soundness criteria.",
+            criteria,
+            violations,
+            kmaxEnsuringResults
         };
     }
 }

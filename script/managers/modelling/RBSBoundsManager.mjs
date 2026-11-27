@@ -26,6 +26,11 @@ export default class RBSBoundsManager {
         this.context = context;
     }
 
+    reset() {
+        this.#cache.rbsComponentsUIDs = {};
+        this.#cache.rbsBounds = {};
+    }
+
     /**
      * @param {number} centerUID
      * @returns {RBSBounds}

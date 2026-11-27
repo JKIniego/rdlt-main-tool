@@ -259,7 +259,7 @@
                                         <tbody></tbody>
                                     </table>
                                     <div class="action-buttons">
-                                        <button data-subaction="add-activity"><i class="fas fa-plus"></i>&nbsp; Add Activity</button>
+                                        <button data-subaction="add-activity" class="requires-valid-model"><i class="fas fa-plus"></i>&nbsp; Add Activity</button>
                                         <button data-subaction="import"><i class="fas fa-file-lines"></i>&nbsp; Import Activity</button>
                                     </div>
                                 </main>
@@ -298,9 +298,12 @@
                                     <div class="input-group checkbox-item">
                                         <input type="checkbox" name="isMaximal"> <label>Maximal Activity</label>
                                     </div>
+                                    <div class="input-group checkbox-item">
+                                        <input type="checkbox" name="isParallel"> <label>Extract Parallel Activities</label>
+                                    </div>
                                     <div class="section-action-buttons">
-                                        <button data-subaction="generate">Generate</button>
-                                        <button data-subaction="simulate"><i class="fas fa-play"></i> &nbsp;Simulate</button>
+                                        <button data-subaction="generate" class="requires-valid-model">Generate</button>
+                                        <button data-subaction="simulate" class="requires-valid-model"><i class="fas fa-play"></i> &nbsp;Simulate</button>
                                     </div>
                                 </main>
                             </div>
@@ -311,7 +314,7 @@
                                         <tbody>
                                             <tr>
                                                 <td>Level 1</td>
-                                                <td><button data-subaction="vs-generate-1"><i class="fas fa-eye"></i> Generate</button></td>
+                                                <td><button data-subaction="vs-generate-1" class="requires-valid-model"><i class="fas fa-eye"></i> Generate</button></td>
                                             </tr>
                                             <tr>
                                                 <td>Level 2</td>
@@ -319,7 +322,7 @@
                                                     <select name="rbs">
                                                         <option>x1</option>
                                                     </select>
-                                                    <button data-subaction="vs-generate-2"><i class="fas fa-eye"></i> Generate</button>
+                                                    <button data-subaction="vs-generate-2" class="requires-valid-model"><i class="fas fa-eye"></i> Generate</button>
                                                 </td>
                                             </tr>
                                         </tbody>
@@ -332,7 +335,18 @@
                                     <tbody>
                                         <tr>
                                             <td>to <b>Petri Net</b></td>
-                                            <td><button data-subaction="convert-to-pn">Convert</button></td>
+                                            <td><button data-subaction="convert-to-pn" class="requires-valid-model">Convert</button></td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div class="collapsible" data-section-id="convert">
+                                <header>Parallel Activities</header>
+                                <table class="anchor-right">
+                                    <tbody>
+                                        <tr>
+                                            <td>Traversal Tree</td>
+                                            <td><button data-action="traversal-tree" class="requires-valid-model">Generate</button></td>
                                         </tr>
                                     </tbody>
                                 </table>
@@ -363,7 +377,7 @@
                                             </div>
                                         </div>
                                         <div>
-                                            <button data-subaction="start"><i class="fas fa-magnifying-glass"></i>&nbsp; Start</button>
+                                            <button data-subaction="start" class="requires-valid-model"><i class="fas fa-magnifying-glass"></i>&nbsp; Start</button>
                                         </div>
                                     </div>
                                 </main>
@@ -394,7 +408,7 @@
                                         <select name="type">
                                             <option value="SDPCS">Σ-distinct PCS</option>
                                         </select>
-                                        <button data-subaction="start">Start</button>
+                                        <button data-subaction="start" class="requires-valid-model">Start</button>
                                     </div>
                                 </main>
                             </div>
@@ -424,15 +438,18 @@
                                         <div>
                                             <label>Soundness Notion</label>
                                             <select name="notion" class="full-width">
+                                                <option value="kmax">kᵐᵃˣ-soundness</option>
                                                 <option value="classical">Classical Soundness</option>
+                                                <option value="classical-lite">Classical (liveness + termination only)</option>
                                                 <option value="relaxed">Relaxed Soundness</option>
                                                 <option value="weak">Weak Soundness</option>
                                                 <option value="easy">Easy Soundness</option>
+                                                <option value="lazy">Lazy Soundness</option>
                                             </select>
                                         </div>
                                     </div>
                                     <div>
-                                        <button data-subaction="start">Start</button>
+                                        <button data-subaction="start" class="requires-valid-model">Start</button>
                                     </div>
                                 </main>
                             </div>
@@ -462,7 +479,67 @@
                                         <!-- <select name="type">
                                             <option value="SDPCS">Σ-distinct PCS</option>
                                         </select> -->
-                                        <button data-subaction="start">Start</button>
+                                        <button data-subaction="start" class="requires-valid-model">Start</button>
+                                    </div>
+                                </main>
+                            </div>
+                            <div class="collapsible" data-section-id="impedance-freeness">
+                                <header>Impedance-Freeness</header>
+                                <main>
+                                    <div class="section-description">
+                                        Verify the input RDLT whether it is impedance-free or otherwise.
+                                    </div>
+                                    <div class="input-group columns full-width">
+                                        <div>
+                                            <label>Source</label>
+                                            <div style="display: flex; gap: 6px;">
+                                                <select name="source" style="flex: 1"></select>
+                                                <button><i class="fas fa-hand"></i></button>
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <label>Sink</label>
+                                            <div style="display: flex; gap: 6px;">
+                                                <select name="sink" style="flex: 1"></select>
+                                                <button><i class="fas fa-hand"></i></button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <!-- <select name="type">
+                                            <option value="SDPCS">Σ-distinct PCS</option>
+                                        </select> -->
+                                        <button data-subaction="start" class="requires-valid-model">Start</button>
+                                    </div>
+                                </main>
+                            </div>
+                            <div class="collapsible" data-section-id="reset-safeness">
+                                <header>Reset-safeness</header>
+                                <main>
+                                    <div class="section-description">
+                                        Verify whether the model is reset-safe (requires maximal activities and RBS out-bridge synchronization).
+                                    </div>
+                                    <div class="input-group columns full-width">
+                                        <div>
+                                            <label>Source</label>
+                                            <div style="display: flex; gap: 6px;">
+                                                <select name="source" style="flex: 1"></select>
+                                                <button><i class="fas fa-hand"></i></button>
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <label>Sink</label>
+                                            <div style="display: flex; gap: 6px;">
+                                                <select name="sink" style="flex: 1"></select>
+                                                <button><i class="fas fa-hand"></i></button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <!-- <select name="type">
+                                            <option value="SDPCS">Σ-distinct PCS</option>
+                                        </select> -->
+                                        <button data-subaction="start" class="requires-valid-model">Start</button>
                                     </div>
                                 </main>
                             </div>

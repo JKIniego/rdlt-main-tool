@@ -109,6 +109,12 @@ export default class DrawingViewManager extends BaseModelDrawingManager {
         return arcBuilder.getBounds();
     }
 
+    resetModelDrawing() {
+        for(const group of Object.values(this.groups)) group.replaceChildren();
+        this.builders = { vertices: {}, arcs: {}, rbs: {} };
+        this.clearHighlights();
+        this.hideHighlight();
+    }
 
     setIsComponentSelected(id, isSelected) {
         const componentBuilder = this.#getComponentBuilder(id);

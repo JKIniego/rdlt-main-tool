@@ -17,114 +17,135 @@ import VerificationsPanelManager from "../panels/VerificationsPanelManager.mjs";
 import { ActivitiesManager } from "../activity/ActivitiesManager.mjs";
 import ImportManager from "../file/import/ImportManager.mjs";
 import ComponentsPanelManager from "../panels/ComponentsPanelManager.mjs";
+import TraversalTreeManager from "../parallel/TraversalTreeManager.mjs";
 
 export default class ModelContext {
-    
-    /** @type {string} */
-    #id;
-    
-    /**
-     * @typedef {{ 
-     *      components: ComponentsPanelManager,
-     *      palette: PalettePanelManager, 
-     *      properties: PropertiesPanelManager, 
-     *      execute: ExecutePanelManager,
-     *      verifications: VerificationsPanelManager
-     * }} PanelManagersGroup 
-     * 
-     * @type {{ 
-     *  model: ModelManager,
-     *  visualModel: VisualModelManager,
-     *  modelling: ModellingManager, 
-     *  drawing: DrawingViewManager,
-     *  arcTracing: ArcTracingManager,
-     *  rbsBounds: RBSBoundsManager,
-     *  dragAndDrop: DragAndDropManager,
-     *  userEvents: UserEventsManager,
-     *  transform: TransformManager,
-     *  workspace: WorkspaceManager,
-     *  import: ImportManager,
-     *  export: ExportManager,
-     *  activities: ActivitiesManager,
-     *  panels: PanelManagersGroup,
-     * }}
-    */
-    managers = {};
+  /** @type {string} */
+  #id;
 
-    #visualModel;
+  /**
+   * @typedef {{
+   *      components: ComponentsPanelManager,
+   *      palette: PalettePanelManager,
+   *      properties: PropertiesPanelManager,
+   *      execute: ExecutePanelManager,
+   *      verifications: VerificationsPanelManager
+   * }} PanelManagersGroup
+   *
+   * @type {{
+   *  model: ModelManager,
+   *  visualModel: VisualModelManager,
+   *  modelling: ModellingManager,
+   *  drawing: DrawingViewManager,
+   *  arcTracing: ArcTracingManager,
+   *  rbsBounds: RBSBoundsManager,
+   *  dragAndDrop: DragAndDropManager,
+   *  userEvents: UserEventsManager,
+   *  transform: TransformManager,
+   *  workspace: WorkspaceManager,
+   *  import: ImportManager,
+   *  export: ExportManager,
+   *  activities: ActivitiesManager,
+   *  traversalTree: TraversalTreeManager,
+   *  panels: PanelManagersGroup,
+   * }}
+   */
+  managers = {};
 
+  #visualModel;
 
-    constructor(id, visualModel) {
-        this.#visualModel = visualModel;
-        this.#id = id || this.#generateID();
+  constructor(id, visualModel) {
+    this.#visualModel = visualModel;
+    this.#id = id || this.#generateID();
+  }
+
+  get id() {
+    return this.#id;
+  }
+
+  #generateID() {
+    const timestamp = Date.now();
+    const chars =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let randomChars = "";
+    for (let i = 0; i < 5; i++) {
+      randomChars += chars.charAt(Math.floor(Math.random() * chars.length));
     }
 
-    get id() { return this.#id; }
+    return `${timestamp}${randomChars}`;
+  }
 
-    #generateID() {
-        const timestamp = Date.now();
-        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        let randomChars = "";
-        for (let i = 0; i < 5; i++) {
-            randomChars += chars.charAt(Math.floor(Math.random() * chars.length));
-        }
+  async initialize() {
+    await this.#setupManagers();
+  }
 
-        return `${timestamp}${randomChars}`;
-    }
+  /**
+   *
+   * @param {VisualRDLTModel} visualModel
+   */
+  async #setupManagers() {
+    // Setup workspace manager and its views
 
-    async initialize() {
-        await this.#setupManagers();
-    }
+    this.managers.visualModel = new VisualModelManager(this, this.#visualModel);
+    this.managers.model = new ModelManager(this);
+    this.managers.modelling = new ModellingManager(this);
 
-    /**
-     * 
-     * @param {VisualRDLTModel} visualModel 
-     */
-    async #setupManagers() {
-        // Setup workspace manager and its views
+    this.managers.arcTracing = new ArcTracingManager(this);
+    this.managers.rbsBounds = new RBSBoundsManager(this);
+    this.managers.dragAndDrop = new DragAndDropManager(this);
 
-        this.managers.visualModel = new VisualModelManager(this, this.#visualModel);
-        this.managers.model = new ModelManager(this);
-        this.managers.modelling = new ModellingManager(this); 
-        
-        this.managers.arcTracing = new ArcTracingManager(this);
-        this.managers.rbsBounds = new RBSBoundsManager(this);
-        this.managers.dragAndDrop = new DragAndDropManager(this);
-        
-        this.managers.transform = new TransformManager(this);
-        this.managers.import = new ImportManager(this);
-        this.managers.export = new ExportManager(this);
-        this.managers.activities = new ActivitiesManager(this);
+    this.managers.transform = new TransformManager(this);
+    this.managers.import = new ImportManager(this);
+    this.managers.export = new ExportManager(this);
+    this.managers.activities = new ActivitiesManager(this);
 
-        const workspaceManager = new WorkspaceManager(this);
-        await workspaceManager.initialize();
-        
-        this.managers.workspace = workspaceManager;
-        this.managers.userEvents = new UserEventsManager(this,
-            { drawingSVG: workspaceManager.getDrawingSVG() });
-        this.managers.drawing = new DrawingViewManager(this,
-            { drawingSVG: workspaceManager.getDrawingSVG() });
-        this.managers.panels = {
-            components: new ComponentsPanelManager(this, workspaceManager.getPanelRootElement("components")),
-            palette: new PalettePanelManager(this, workspaceManager.getPanelRootElement("palette")),
-            properties: new PropertiesPanelManager(this, workspaceManager.getPanelRootElement("properties")),
-            execute: new ExecutePanelManager(this, workspaceManager.getPanelRootElement("execute")),
-            verifications: new VerificationsPanelManager(this, workspaceManager.getPanelRootElement("verifications"))
-        };
+    this.managers.traversalTree = new TraversalTreeManager(this);
 
-        this.managers.modelling.loadModel();
-    }
+    const workspaceManager = new WorkspaceManager(this);
+    await workspaceManager.initialize();
 
-    
-    getModelName() {
-        return this.managers.visualModel.getModelName();
-    }
+    this.managers.workspace = workspaceManager;
+    this.managers.userEvents = new UserEventsManager(this, {
+      drawingSVG: workspaceManager.getDrawingSVG(),
+    });
+    this.managers.drawing = new DrawingViewManager(this, {
+      drawingSVG: workspaceManager.getDrawingSVG(),
+    });
+    this.managers.panels = {
+      components: new ComponentsPanelManager(
+        this,
+        workspaceManager.getPanelRootElement("components"),
+      ),
+      palette: new PalettePanelManager(
+        this,
+        workspaceManager.getPanelRootElement("palette"),
+      ),
+      properties: new PropertiesPanelManager(
+        this,
+        workspaceManager.getPanelRootElement("properties"),
+      ),
+      execute: new ExecutePanelManager(
+        this,
+        workspaceManager.getPanelRootElement("execute"),
+      ),
+      verifications: new VerificationsPanelManager(
+        this,
+        workspaceManager.getPanelRootElement("verifications"),
+      ),
+    };
 
-    onContextOpened() {
-        this.managers.drawing.viewport.refresh();
-    }
+    this.managers.modelling.loadModel();
+  }
 
-    static fromJSON(json) {
-        return new ModelContext(json.id, VisualRDLTModel.fromJSON(json.model));
-    }
+  getModelName() {
+    return this.managers.visualModel.getModelName();
+  }
+
+  onContextOpened() {
+    this.managers.drawing.viewport.refresh();
+  }
+
+  static fromJSON(json) {
+    return new ModelContext(json.id, VisualRDLTModel.fromJSON(json.model));
+  }
 }

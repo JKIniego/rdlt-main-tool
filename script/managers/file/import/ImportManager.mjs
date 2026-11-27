@@ -15,44 +15,58 @@ export default class ImportManager {
     }
 
     async importRDLTFile() {
-        const raw = await this.#importFileThenRead();
-        if(!raw) return;
+        const filesData = await this.#importFilesThenRead(".txt", true);
+        if(!filesData) return;
 
-        const visualModel = RDLTImportManager.loadRDLTModel(raw);
-        if(!visualModel) return;
+        for(const fileData of filesData) {
+            const modelName = fileData.name.replace(/\.[^.]+$/, "");
+            const visualModel = RDLTImportManager.loadRDLTModel(fileData.text, modelName);
+            if(!visualModel) continue;
 
-        App.addContext(visualModel);
+            await App.addContext(visualModel);
+        }
     }
 
     async importActivityFile() {
-        const raw = await this.#importFileThenRead();
-        if(!raw) return;
+        const [fileData] = await this.#importFilesThenRead();
+        if(!fileData) return;
 
-        const activity = ActivityImportManager.loadActivity(raw);
+        const activity = ActivityImportManager.loadActivity(fileData.text);
         if(!activity) return;
 
         this.context.managers.activities.addActivity(activity);
     }
 
-    #importFileThenRead(accept = ".txt") {
-        return new Promise(resolve => {
+    #importFilesThenRead(accept = ".txt", multiple = false) {
+        return new Promise((resolve, reject) => {
             const importField = document.createElement("input");
-            importField.setAttribute("type", "file");
-            importField.setAttribute("accept", accept);
+            importField.type = "file";
+            importField.accept = accept;
+            importField.multiple = multiple;
 
             importField.addEventListener("change", (event) => {
                 importField.remove();
 
-                const file = event.target.files[0];
-                if(!file) return resolve(null);
+                const files = Array.from(event.target.files || []);
+                if(files.length === 0) return resolve([]);
 
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    const text = e.target.result;
-                    resolve(text);
-                };
+                Promise.all(files.map(file => new Promise((resolveFile, rejectFile) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolveFile({
+                        text: reader.result,
+                        name: file.name
+                    });
+                    reader.onerror = () => rejectFile(
+                        reader.error || new Error(`Failed to read ${file.name}.`)
+                    );
 
-                reader.readAsText(file);
+                    reader.readAsText(file);
+                }))).then(resolve, reject);
+            });
+
+            importField.addEventListener("cancel", () => {
+                importField.remove();
+                resolve([]);
             });
 
             document.querySelector("#tmp").appendChild(importField);
@@ -60,5 +74,4 @@ export default class ImportManager {
         });
     }
 }
-
 

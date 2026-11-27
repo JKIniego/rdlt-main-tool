@@ -1,0 +1,1966 @@
+/*
+Service Module for Parallel Activity Extraction (PAE)
+Based on Algorithm 2 from Doñoz (2024).
+
+Key differences from aes.mjs (sequential AE):
+  - Multiple processes run concurrently from the source
+  - No backtracking — pending processes wait at join points
+  - eRU is enforced across ALL processes combined, not per-process
+  - Splits spawn new child processes
+  - Competition: lowest process ID wins, losers are locked
+  - Process interruption: exiting an RBS while a sibling is still inside
+*/
+
+import {
+  getIncomingArcs,
+  getOutgoingArcs,
+  isEpsilon,
+  isOutbridge,
+  areTypeAlikeIncoming,
+} from "../utils.mjs";
+import {
+  checkArc,
+  traverseArc,
+  getMaxT,
+  getArcTraversals,
+  isArcPreviouslyChecked,
+} from "./aes.mjs";
+import { checkCompetingProcesses } from "./impedance-freeness.mjs";
+import { Cycle } from "./soundness/utils/cycle.mjs";
+
+
+/**
+ * @typedef {number} ArcUID
+ * @typedef {number} VertexUID
+ *
+ * @typedef {{
+ *   arcs: object[],
+ *   arcMap: object,
+ *   vertexMap: object,
+ *   arcsMatrix: object,
+ *   rbsMatrix: object
+ * }} Cache
+ *
+ * @typedef {{
+ *   id: number,
+ *   currentVertex: VertexUID,
+ *   status: "active" | "pending" | "locked" | "done",
+ *   pendingArcUID: ArcUID | null,
+ *   nextArcUID: ArcUID | null,
+ *   states: {
+ *     T: object,
+ *     CTIndicator: object,
+ *     path: VertexUID[],
+ *     activityProfile: object,
+ *     tor: object
+ *   }
+ * }} Process
+ *
+ * @typedef {{
+ *   arcUID: ArcUID,
+ *   winnerProcessId: number,
+ *   loserProcessIds: number[],
+ *   totalTraversals: number,
+ *   arcL: number,
+ *   reason: string
+ * }} CompetitionEntry
+ *
+ * @typedef {{
+ *   parallelActivitySets: { processId: number, activityProfile: object }[][],
+ *   isParallel: boolean,
+ *   competitionLog: CompetitionEntry[]
+ * } | null} PAEResult
+ */
+
+// SECTION 1 — Process lifecycle
+
+export function createProcess(id, startVertex) {
+  return {
+    id,
+    currentVertex: startVertex,
+    nextArcUID: null,
+    status: "active",
+    pendingArcUID: null,
+    /**
+     * Process Interruption marker. If non-null, this process was inside an
+     * RBS at the moment another process exited that RBS via an outbridge.
+     *
+     * Value is the RBS center UID of the interrupting RBS. The process is
+     * marked status='pending' until either:
+     *   - a future AND/MIX-join with the interrupting process's path resolves
+     *     it (B is then unblocked and merged via resolvePendingProcesses), or
+     *   - no such join exists in B's forward reachability → B is locked.
+     *
+     * Cleared once B exits the RBS itself (current vertex is no longer in
+     * VGu of the interrupting RBS center).
+     */
+    interruptedByRBS: null,
+    /**
+     * The id of the specific process whose outbridge traversal triggered the
+     * PI marker. Tracked so the resume logic can verify the interrupting
+     * lineage (or one of its descendants/absorbers) is still alive and can
+     * reach a shared AND/MIX-join. If the interrupting process locks or
+     * terminates without ever sharing a join with us, we lock.
+     */
+    interruptedByProcessId: null,
+    states: {
+      T: {},
+      CTIndicator: {},
+      path: [startVertex],
+      activityProfile: {},
+      tor: {},
+    },
+  };
+}
+
+export function lockProcess(process) {
+  process.status = "locked";
+}
+
+export function markProcessPending(process, arcUID) {
+  process.status = "pending";
+  process.pendingArcUID = arcUID;
+}
+
+// SECTION 2 — Split handling
+
+export function getSplitType(vertexUID, cache) {
+  const { arcsMatrix, arcMap } = cache;
+  const outgoing = [...getOutgoingArcs(vertexUID, arcsMatrix)];
+
+  if (outgoing.length <= 1) return "none";
+
+  const cValues = outgoing.map((uid) => arcMap[uid].C);
+  const allSameC = cValues.every((c) => c === cValues[0]);
+  if (allSameC) return "AND";
+
+  const allSigma = outgoing.every((uid) => !isEpsilon(arcMap[uid]));
+  if (allSigma) return "OR";
+
+  return "MIX";
+}
+
+export function spawnProcessesFromSplit(parentProcess, splitArcUIDs, idCounter) {
+  const spawned = [];
+  for (let i = 1; i < splitArcUIDs.length; i++) {
+    const newProcess = createProcess(idCounter.nextId++, parentProcess.currentVertex);
+    newProcess.states = structuredClone(parentProcess.states);
+    newProcess.nextArcUID = splitArcUIDs[i];
+    spawned.push(newProcess);
+  }
+  return spawned;
+}
+
+// SECTION 3 — Join detection and resolution
+
+/**
+ * Returns the set of vertex UIDs reachable from `startUID` by following
+ * outgoing arcs forward. Used to decide whether an active process can still
+ * arrive on a given incoming arc of an AND-join — i.e. whether the join's
+ * partner slot can still be filled. BFS over the adjacency matrix, ignores
+ * L-attributes and constraints (we only ask about graph reachability, not
+ * whether a specific traversal is currently legal).
+ *
+ * @param {VertexUID} startUID
+ * @param {object} arcsMatrix
+ * @returns {Set<VertexUID>}
+ */
+export function forwardReachableVertices(startUID, arcsMatrix) {
+  const seen = new Set([startUID]);
+  const queue = [startUID];
+  while (queue.length) {
+    const v = queue.shift();
+    const outs = arcsMatrix[v] ?? {};
+    for (const toVertexUID of Object.keys(outs)) {
+      const tu = Number(toVertexUID);
+      if (seen.has(tu)) continue;
+      // Has at least one outgoing arc to this neighbour
+      const arcsTo = outs[toVertexUID];
+      if (!arcsTo || (Array.isArray(arcsTo) && arcsTo.length === 0) ||
+          (arcsTo instanceof Set && arcsTo.size === 0)) continue;
+      seen.add(tu);
+      queue.push(tu);
+    }
+  }
+  return seen;
+}
+
+/**
+ * Returns true if some non-terminal process can still arrive on `targetArcUID`
+ * (an incoming arc of a join vertex). A process can arrive if:
+ *   - it is already pending on that arc, or
+ *   - it is active and its currentVertex can forward-reach the source of
+ *     the target arc (so it has at least one path to that incoming arc).
+ *
+ * Locked and done processes are ignored — they cannot fill the slot.
+ *
+ * @param {ArcUID} targetArcUID
+ * @param {Process[]} processes
+ * @param {Cache} cache
+ * @returns {boolean}
+ */
+export function canStillArriveOnArc(targetArcUID, processes, cache) {
+  const { arcMap, arcsMatrix } = cache;
+  const targetArc = arcMap[targetArcUID];
+  if (!targetArc) return false;
+  const targetSource = targetArc.fromVertexUID;
+
+  for (const p of processes) {
+    if (p.status === "locked" || p.status === "done") continue;
+
+    if (p.pendingArcUID === targetArcUID) return true;
+
+    if (p.status === "active") {
+      const reachable = forwardReachableVertices(p.currentVertex, arcsMatrix);
+      if (reachable.has(targetSource)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Classifies the join type at a vertex.
+ *
+ * For MIX joins (mix of ε and Σ incoming arcs):
+ *   - MIX-AND-join: the asking process's OWN T already has the Σ arc checked.
+ *     This means the Σ arc was traversed by THIS process's ancestry, so it must
+ *     wait to merge (it's the ε process arriving after the Σ process already ran).
+ *   - MIX-OR-join: the asking process's OWN T has NOT seen the Σ arc yet.
+ *     This means the Σ arc process hasn't reached here yet — the ε process
+ *     arrived first and should pass through independently.
+ */
+export function getJoinType(vertexUID, cache, processes = [], askingProcess = null) {
+  const { arcsMatrix, arcMap } = cache;
+  const incoming = [...getIncomingArcs(vertexUID, arcsMatrix)];
+
+  if (incoming.length <= 1) return "none";
+
+  const hasEpsilon = incoming.some((uid) => isEpsilon(arcMap[uid]));
+  const hasSigma   = incoming.some((uid) => !isEpsilon(arcMap[uid]));
+
+  if (hasEpsilon && hasSigma) {
+    const sigmaArcs = incoming.filter((uid) => !isEpsilon(arcMap[uid]));
+
+    // Check whether THIS process's own T has seen the Σ arc
+    const sigmaChecked = askingProcess
+      ? sigmaArcs.some((arcUID) =>
+          askingProcess.states.T[arcUID] && askingProcess.states.T[arcUID].length > 0
+        )
+      : sigmaArcs.some((arcUID) =>
+          processes.some((p) => p.states.T[arcUID] && p.states.T[arcUID].length > 0)
+        );
+
+    return sigmaChecked ? "MIX-AND-join" : "MIX-OR-join";
+  }
+
+  const cValues = incoming.map((uid) => arcMap[uid].C);
+  const allSameC = cValues.every((c) => c === cValues[0]);
+  return allSameC ? "OR-join" : "AND-join";
+}
+
+/**
+ * Resolves pending processes at an AND or MIX-AND join.
+ *
+ * After merging, for MIX-AND joins it also spawns an independent clone
+ * representing the MIX-OR path — the ε arc process that passes through
+ * independently without merging with the Σ arc process.
+ *
+ * @param {Process[]} processes
+ * @param {VertexUID} joinVertexUID
+ * @param {Cache} cache
+ * @param {{ nextId: number }} idCounter  needed to create the MIX-OR clone
+ * @returns {boolean}
+ */
+export function resolvePendingProcesses(processes, joinVertexUID, cache, idCounter) {
+  const { arcsMatrix, arcMap } = cache;
+  const incomingArcs = [...getIncomingArcs(joinVertexUID, arcsMatrix)];
+
+  const pendingHere = processes.filter(
+    (p) =>
+      p.status === "pending" &&
+      p.pendingArcUID !== null &&
+      arcMap[p.pendingArcUID]?.toVertexUID === joinVertexUID,
+  );
+
+  if (pendingHere.length === 0) return false;
+
+  // All incoming arcs must have a process pending on them
+  const allArrived = incomingArcs.every((arcUID) =>
+    processes.some(
+      (p) =>
+        (p.status === "active" || p.status === "pending") &&
+        p.pendingArcUID === arcUID,
+    ),
+  );
+
+  if (!allArrived) return false;
+
+  // ── Ancestry-based grouping ───────────────────────────────────────────────
+  // When multiple parallel activities each go through their own AND-split and
+  // reconverge at the same AND-join vertex, we must only merge processes that
+  // belong to the SAME activity (i.e. came from the same split ancestry).
+  // Strategy: group pending processes by finding the maximal matching sets
+  // where each set has exactly one process per incoming arc, prioritising
+  // groups whose path histories share the most common prefix (same ancestry).
+  //
+  // Build pendingByArc map needed for variant construction below
+  const pendingByArc = new Map(); // arcUID → Process[]
+  for (const arcUID of incomingArcs) {
+    pendingByArc.set(arcUID, pendingHere.filter(p => p.pendingArcUID === arcUID));
+  }
+
+  // Check every incoming arc has at least one pending process
+  const hasAllArcs = incomingArcs.every(uid => (pendingByArc.get(uid)?.length ?? 0) > 0);
+  if (!hasAllArcs) return false;
+
+  // ── OR-subgroup-aware merge variants ──────────────────────────────────────
+  // When an AND-join has multiple incoming arcs sharing the same C-value,
+  // those arcs form an OR-subgroup (Structure 8 from manuscript §3.3). The
+  // join produces multiple merge variants — one per Cartesian-product choice
+  // of "one arc per C-group". Each variant becomes its own surviving activity.
+  //
+  // Example: at x4 with incoming = [(x2→x4, 'a'), (x3→x4, 'a'), (x5→x4, 'b')],
+  //   C-groups: { 'a': [x2-arc, x3-arc], 'b': [x5-arc] }
+  //   Variants: { 'a':x2-arc + 'b':x5-arc },  { 'a':x3-arc + 'b':x5-arc }
+  //   → two merged activities, sharing the same x5-arc traversal but
+  //     differing in which 'a'-arc was used.
+  //
+  // For C-groups with only one arc, that arc participates in EVERY variant.
+  // Its pending process must be CLONED for each variant beyond the first so
+  // the same state can be merged into multiple parallel survivors.
+
+  // Group incoming arcs by C-value
+  const arcsByC = new Map();
+  for (const uid of incomingArcs) {
+    const c = arcMap[uid].C ?? '';
+    if (!arcsByC.has(c)) arcsByC.set(c, []);
+    arcsByC.get(c).push(uid);
+  }
+
+  // Build Cartesian product of arc choices, one per C-group
+  let variants = [[]]; // each variant is an array of arcUIDs
+  for (const [, arcsInGroup] of arcsByC.entries()) {
+    const next = [];
+    for (const variant of variants) {
+      for (const arcUID of arcsInGroup) {
+        next.push([...variant, arcUID]);
+      }
+    }
+    variants = next;
+  }
+
+  // For each variant, build the corresponding mergeGroup of processes by
+  // matching arcUID → pending process. If multiple processes are pending on
+  // the same arcUID, pick the lowest ID for the first variant that uses
+  // that arc, etc.
+  // Track which processes have already been "consumed" by an earlier variant
+  // for unique arcs (per-variant ownership). For shared single-arc C-groups,
+  // we'll clone the process for each variant beyond the first.
+
+  // First pass: pre-identify processes per arc
+  const processesPerArc = new Map(); // arcUID → Process[] sorted by ID
+  for (const uid of incomingArcs) {
+    const procs = pendingByArc.get(uid) ?? [];
+    procs.sort((a, b) => a.id - b.id);
+    processesPerArc.set(uid, [...procs]); // copy
+  }
+
+  // Build the variant merge groups. For each variant:
+  //   - If the variant's arcUID has multiple processes pending, pick a unique one
+  //     (consuming from the per-arc list).
+  //   - If the arc has only one pending process and it's already consumed,
+  //     CLONE that process's state for use in this variant.
+  const variantGroups = []; // each: { mergeGroup, isCloned: arcUID → boolean }
+  // Tracking consumed processes per arc across variants
+  const consumed = new Map();
+  for (const uid of incomingArcs) consumed.set(uid, 0);
+
+  for (const variantArcs of variants) {
+    const mergeGroup = [];
+    const clonedProcs = new Map(); // arcUID → cloned proc (so we can clean up later)
+
+    for (const arcUID of variantArcs) {
+      const procs = processesPerArc.get(arcUID) ?? [];
+      const consumedCount = consumed.get(arcUID) ?? 0;
+
+      if (consumedCount < procs.length) {
+        // Use the next un-consumed process
+        mergeGroup.push(procs[consumedCount]);
+        consumed.set(arcUID, consumedCount + 1);
+      } else {
+        // All processes for this arc consumed — must clone an existing one.
+        // Use the FIRST process (lowest ID) and clone its pre-merge state.
+        const original = procs[0];
+        if (!original) {
+          // Shouldn't happen given allArrived check, but safe
+          continue;
+        }
+        if (!idCounter) {
+          // No idCounter available — can't clone. Skip this variant.
+          mergeGroup.length = 0;
+          break;
+        }
+        const cloneState = structuredClone(original.states);
+        const clone = {
+          id: idCounter.nextId++,
+          currentVertex: original.currentVertex,
+          nextArcUID: original.nextArcUID,
+          status: 'pending',
+          pendingArcUID: arcUID,
+          interruptedByRBS: original.interruptedByRBS ?? null,
+          interruptedByProcessId: original.interruptedByProcessId ?? null,
+          states: cloneState,
+        };
+        processes.push(clone);
+        mergeGroup.push(clone);
+        clonedProcs.set(arcUID, clone);
+        console.log(
+          `  Cloned Process ${original.id} → Process ${clone.id} ` +
+          `(shared arc ${arcUID} needed for OR-subgroup merge variant)`
+        );
+      }
+    }
+
+    if (mergeGroup.length === variantArcs.length && mergeGroup.length > 0) {
+      variantGroups.push({ mergeGroup, clonedProcs });
+    }
+  }
+
+  if (variantGroups.length === 0) return false;
+
+  // Now process each variant — perform the merge for each variant group.
+  // The first variant's survivor is the lowest-ID original process; subsequent
+  // variants get their own survivors (any of their group members).
+  //
+  // For MIX-joins: the MIX-OR independent path (Σ arc going through alone)
+  // represents ONE activity choice — Σ fires without merging with any ε
+  // partner. Even when multiple MIX-AND merge variants exist (one per ε
+  // partner), there is still only one MIX-OR independent activity. We
+  // therefore spawn the MIX-OR clone only on the FIRST variant; subsequent
+  // variants suppress it to avoid producing duplicate Σ-only activities.
+  let resolvedAny = false;
+  for (let vIdx = 0; vIdx < variantGroups.length; vIdx++) {
+    const { mergeGroup: resolveGroup } = variantGroups[vIdx];
+    const ok = mergeOneVariant(
+      resolveGroup,
+      incomingArcs,
+      joinVertexUID,
+      processes,
+      cache,
+      idCounter,
+      vIdx === 0, // spawnMixOrClone — only on the first variant
+    );
+    if (ok) resolvedAny = true;
+  }
+
+  return resolvedAny;
+}
+
+/**
+ * Performs a single merge: combine the resolveGroup of pending processes into
+ * a survivor at the join vertex. Used by resolvePendingProcesses for each
+ * Cartesian-product variant of an AND-join with OR-subgroups.
+ *
+ * @param {boolean} spawnMixOrClone  Whether to spawn the MIX-OR independent
+ *   clone on this merge. For MIX-joins with multiple variants, only the first
+ *   variant should spawn the clone — the MIX-OR path is one activity choice
+ *   regardless of how many MIX-AND merge variants exist.
+ */
+function mergeOneVariant(resolveGroup, incomingArcs, joinVertexUID, processes, cache, idCounter, spawnMixOrClone = true) {
+  const { arcMap } = cache;
+
+  // Determine if this is a MIX-AND join (has both ε and Σ incoming arcs)
+  const isMixJoin = incomingArcs.some((uid) => isEpsilon(arcMap[uid])) &&
+                    incomingArcs.some((uid) => !isEpsilon(arcMap[uid]));
+
+  // For MIX-AND: find the ε arc process — it will be cloned for the MIX-OR path
+  const epsArcUID = isMixJoin
+    ? incomingArcs.find((uid) => isEpsilon(arcMap[uid]))
+    : null;
+  const epsProcess = epsArcUID
+    ? resolveGroup.find((p) => p.pendingArcUID === epsArcUID)
+    : null;
+
+  // Compute synchronized max timestep across the resolved group only
+  const combinedT = {};
+  for (const proc of resolveGroup) {
+    for (const [arcUID, times] of Object.entries(proc.states.T)) {
+      if (!combinedT[arcUID]) combinedT[arcUID] = [];
+      combinedT[arcUID].push(...times);
+    }
+  }
+  const maxT = getMaxT(incomingArcs, combinedT);
+
+  // Sort by ID — lowest ID is the survivor
+  resolveGroup.sort((a, b) => a.id - b.id);
+  const survivor = resolveGroup[0];
+  const absorbed = resolveGroup.slice(1);
+
+  // Snapshot Σ process states BEFORE merge (needed for MIX-OR clone)
+  const sigmaArcUIDsForSnapshot = incomingArcs.filter((uid) => !isEpsilon(arcMap[uid]));
+  const sigmaProcessForClone = resolveGroup.find(p => sigmaArcUIDsForSnapshot.includes(p.pendingArcUID));
+  const sigmaStateSnapshot = sigmaProcessForClone ? structuredClone(sigmaProcessForClone.states) : null;
+  // Capture the Σ arc UID NOW, before the absorption loop nulls out pendingArcUID
+  // on absorbed processes. Used later by the MIX-OR clone block.
+  const sigmaArcUIDForClone = sigmaProcessForClone ? sigmaProcessForClone.pendingArcUID : null;
+
+  // Capture pendingArcUIDs of all members of the resolve group BEFORE the
+  // absorption loop clears them. We need these to record the join in the
+  // survivor's activity profile after the merge.
+  const absorbedPendingArcs = absorbed.map(p => p.pendingArcUID);
+
+  // Merge absorbed processes into the survivor
+  for (const proc of absorbed) {
+    for (const [arcUID, times] of Object.entries(proc.states.T)) {
+      if (!survivor.states.T[arcUID]) survivor.states.T[arcUID] = [];
+      survivor.states.T[arcUID].push(...times);
+    }
+
+    for (const [arcUID, ctis] of Object.entries(proc.states.CTIndicator)) {
+      if (!survivor.states.CTIndicator[arcUID])
+        survivor.states.CTIndicator[arcUID] = [];
+      survivor.states.CTIndicator[arcUID].push(...ctis);
+    }
+
+    for (const [timestep, arcSet] of Object.entries(proc.states.activityProfile)) {
+      if (!survivor.states.activityProfile[timestep]) {
+        survivor.states.activityProfile[timestep] = new Set();
+      }
+      for (const arcUID of arcSet) {
+        survivor.states.activityProfile[timestep].add(arcUID);
+      }
+    }
+
+    for (const vertexUID of proc.states.path) {
+      if (!survivor.states.path.includes(vertexUID)) {
+        survivor.states.path.push(vertexUID);
+      }
+    }
+
+    proc.status = "locked";
+    proc.pendingArcUID = null;
+    console.log(`  Process ${proc.id} absorbed into Process ${survivor.id} at vertex ${joinVertexUID}`);
+  }
+
+  // Advance survivor to the join vertex
+  survivor.status = "active";
+  survivor.currentVertex = joinVertexUID;
+
+  if (!(maxT in survivor.states.activityProfile)) {
+    survivor.states.activityProfile[maxT] = new Set();
+  }
+
+  // Record all joining arc UIDs in profile and finalize CTIndicator (1→2)
+  const allJoiningArcs = [
+    survivor.pendingArcUID,
+    ...absorbedPendingArcs,
+  ].filter(Boolean);
+
+  for (const joiningArcUID of allJoiningArcs) {
+    survivor.states.activityProfile[maxT].add(joiningArcUID);
+
+    // Finalize CTIndicator: mark as traversed (2) not just checked (1)
+    if (survivor.states.CTIndicator[joiningArcUID]) {
+      const cti = survivor.states.CTIndicator[joiningArcUID];
+      cti[cti.length - 1] = 2;
+    }
+    // Finalize T to maxT
+    if (survivor.states.T[joiningArcUID]) {
+      const t = survivor.states.T[joiningArcUID];
+      t[t.length - 1] = maxT;
+    }
+  }
+
+  survivor.pendingArcUID = null;
+
+  console.log(`  Survivor Process ${survivor.id} now at vertex ${joinVertexUID} (t=${maxT})`);
+
+  // MIX join: also spawn an independent clone for the MIX-OR path.
+  //
+  // Per the manuscript (Doñoz 2024) and the MIX-join semantics:
+  //   - MIX-AND path (survivor): the ε arc waited and merged WITH the Σ arc.
+  //     The survivor's profile already contains both joining arcs at t=maxT.
+  //   - MIX-OR path (clone):  the Σ arc passes through INDEPENDENTLY without
+  //     waiting for the ε arc. Clone uses only the Σ process's pre-merge
+  //     state — its ancestry, its T/CTIndicator, its activity profile.
+  //
+  // The clone resumes from the join vertex as a fresh active process, ready
+  // to continue the activity that took the Σ path alone.
+  if (isMixJoin && spawnMixOrClone && idCounter && sigmaStateSnapshot && sigmaArcUIDForClone !== null) {
+    // Record the Σ arc traversal in the clone at the join time-step.
+    // Like the survivor, this finalizes the Σ arc as traversed (CTI 1→2)
+    // and records its actual traversal time. The ε arc is NOT recorded —
+    // that's the whole point of the MIX-OR path: only Σ fires here.
+    if (!(maxT in sigmaStateSnapshot.activityProfile)) {
+      sigmaStateSnapshot.activityProfile[maxT] = new Set();
+    }
+    sigmaStateSnapshot.activityProfile[maxT].add(sigmaArcUIDForClone);
+
+    if (sigmaStateSnapshot.CTIndicator[sigmaArcUIDForClone]) {
+      const cti = sigmaStateSnapshot.CTIndicator[sigmaArcUIDForClone];
+      cti[cti.length - 1] = 2;
+    }
+    if (sigmaStateSnapshot.T[sigmaArcUIDForClone]) {
+      const t = sigmaStateSnapshot.T[sigmaArcUIDForClone];
+      t[t.length - 1] = maxT;
+    }
+
+    if (!sigmaStateSnapshot.path.includes(joinVertexUID)) {
+      sigmaStateSnapshot.path.push(joinVertexUID);
+    }
+
+    const clone = createProcess(idCounter.nextId++, joinVertexUID);
+    clone.states = sigmaStateSnapshot;
+    processes.push(clone);
+    console.log(
+      `  Spawned MIX-OR Σ-only clone Process ${clone.id} at vertex ${joinVertexUID} ` +
+      `(Σ arc ${sigmaArcUIDForClone} recorded at t=${maxT}, path: [${sigmaStateSnapshot.path.join(",")}])`
+    );
+  }
+
+  return true;
+}
+
+// SECTION 4 — Competition handling
+
+export function getTotalArcTraversals(processes, arcUID) {
+  let total = 0;
+  for (const proc of processes) {
+    total += getArcTraversals(arcUID, proc.states.CTIndicator);
+  }
+  return total;
+}
+
+/**
+ * Returns the set of active processes that are simultaneously trying to
+ * traverse `arcUID` when doing so would exceed the arc's L-attribute.
+ *
+ * "Competing" means: the arc has already been consumed L times in aggregate
+ * across all processes, OR multiple processes are simultaneously at the
+ * arc's source vertex and the combined demand exceeds L.
+ *
+ * @param {Process[]} processes
+ * @param {ArcUID} arcUID
+ * @param {Cache} cache
+ * @returns {Process[]}  empty when no competition exists
+ */
+export function getCompetingProcesses(processes, arcUID, cache) {
+  const { arcMap } = cache;
+  const arc = arcMap[arcUID];
+  if (!arc) return [];
+
+  // Candidates: active processes currently AT the arc's source vertex
+  // AND specifically assigned to this arc (nextArcUID matches).
+  // A process spawned from an OR-split at the same vertex but assigned
+  // to a different arc is NOT a competitor for this arc.
+  const candidates = processes.filter(
+    (p) =>
+      p.status === "active" &&
+      p.currentVertex === arc.fromVertexUID &&
+      (p.nextArcUID === arcUID || p.nextArcUID === null),
+  );
+
+  if (candidates.length <= 1) return [];
+
+  // Total traversals already committed across ALL processes
+  const committed = getTotalArcTraversals(processes, arcUID);
+
+  // If all candidates could still traverse without exceeding L, no competition
+  if (committed + candidates.length <= arc.L) return [];
+
+  return candidates;
+}
+
+/**
+ * Detects competition among active processes trying the same arc, resolves it
+ * by locking all losers (lowest process ID wins), and records the event.
+ *
+ * Call this BEFORE checkArc / traverseArc for any arc that has multiple
+ * simultaneous candidates.
+ *
+ * @param {Process[]} processes
+ * @param {ArcUID} arcUID
+ * @param {Cache} cache
+ * @param {CompetitionEntry[]} competitionLog  mutated in-place
+ * @returns {boolean}  true if competition was detected and resolved
+ */
+export function resolveCompetition(processes, arcUID, cache, competitionLog) {
+  const competitors = getCompetingProcesses(processes, arcUID, cache);
+  if (competitors.length === 0) return false;
+
+  const { arcMap } = cache;
+  const arc = arcMap[arcUID];
+  const committed = getTotalArcTraversals(processes, arcUID);
+
+  // Nondeterministic selection: shuffle competitors so the winner is not
+  // determined by process ID. In the formal model, when multiple processes
+  // arrive at the same time, any subset of size ≤ remaining may proceed.
+  for (let i = competitors.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [competitors[i], competitors[j]] = [competitors[j], competitors[i]];
+  }
+
+  // How many more traversals are available?
+  const remaining = Math.max(0, arc.L - committed);
+  const winners   = competitors.slice(0, remaining > 0 ? remaining : 1);
+  const losers    = competitors.slice(winners.length);
+
+  for (const loser of losers) {
+    lockProcess(loser);
+    console.log(
+      `  Competition on arc ${arcUID} (L=${arc.L}, committed=${committed}): ` +
+      `Process ${loser.id} LOCKED (winner(s): ${winners.map(w => `Process ${w.id}`).join(", ")})`,
+    );
+  }
+
+  if (losers.length > 0) {
+    competitionLog.push({
+      arcUID,
+      winnerProcessId:  winners[0]?.id ?? null,
+      winnerProcessIds: winners.map(w => w.id),
+      loserProcessIds:  losers.map((p) => p.id),
+      totalTraversals:  committed,
+      arcL:             arc.L,
+      reason:
+        `Arc (uid=${arcUID}) has L=${arc.L} but ${competitors.length} processes ` +
+        `simultaneously attempted it (${committed} already committed). ` +
+        `Process(es) ${winners.map(w => w.id).join(", ")} win; ` +
+        `process(es) ${losers.map((p) => p.id).join(", ")} locked.`,
+    });
+  }
+
+  return losers.length > 0;
+}
+
+// SECTION 5 — Process interruption
+
+/**
+ * Builds the set of vertices VGu of an RBS Gu given its center UID. Per the
+ * matrix-representation definition (Malinao 2017): VGu = {u} ∪ {v ∈ V :
+ * (u, v) ∈ E ∧ C((u, v)) = ε}. Only direct ε-children of the center.
+ *
+ * The cache.rbsMatrix maps every member vertex UID → its RBS center UID.
+ * This helper enumerates members of one specific RBS by reverse-lookup.
+ *
+ * @param {VertexUID} centerUID
+ * @param {Cache} cache
+ * @returns {Set<VertexUID>}
+ */
+export function getRBSMembers(centerUID, cache) {
+  const members = new Set();
+  for (const [vertexStr, ownerCenter] of Object.entries(cache.rbsMatrix)) {
+    if (Number(ownerCenter) === Number(centerUID)) {
+      members.add(Number(vertexStr));
+    }
+  }
+  return members;
+}
+
+/**
+ * Returns true if vertex `u` is currently inside RBS centered at `centerUID`.
+ *
+ * @param {VertexUID} u
+ * @param {VertexUID} centerUID
+ * @param {Cache} cache
+ * @returns {boolean}
+ */
+export function isVertexInRBS(u, centerUID, cache) {
+  return Number(cache.rbsMatrix[u]) === Number(centerUID);
+}
+
+/**
+ * Searches for a vertex along B's forward-reachable path that:
+ *   - is itself a join vertex (has more than one incoming arc), and
+ *   - is also forward-reachable from A's current vertex (so the two paths
+ *     can actually meet there), and
+ *   - has join type AND-join, MIX-AND-join, or MIX-OR-join (any join type
+ *     that can resolve the PI per the manuscript: "resolved when they
+ *     eventually merge in an AND or MIX-join that traverses the C(x,y)=ε
+ *     condition first").
+ *
+ * Returns the first such vertex UID found, or null if no resolution is
+ * possible (in which case the interrupted process should be locked —
+ * the deadlock case from line 100 of Algorithm 2).
+ *
+ * @param {VertexUID} bVertex - B's current position (inside RBS)
+ * @param {VertexUID} aVertex - A's current position (just exited RBS)
+ * @param {Process[]} processes
+ * @param {Cache} cache
+ * @returns {VertexUID | null}
+ */
+export function findInterruptionResolutionVertex(bVertex, aVertex, processes, cache) {
+  const { arcsMatrix, vertexMap } = cache;
+  const bReachable = forwardReachableVertices(bVertex, arcsMatrix);
+  const aReachable = forwardReachableVertices(aVertex, arcsMatrix);
+
+  for (const candidate of bReachable) {
+    if (!aReachable.has(candidate)) continue;
+    if (candidate === bVertex || candidate === aVertex) continue;
+
+    const incoming = [...getIncomingArcs(candidate, arcsMatrix)];
+    if (incoming.length < 2) continue; // not a join vertex
+
+    const joinType = getJoinType(candidate, cache, processes, null);
+    // Per the manuscript, PI resolves only at AND/MIX-joins. OR-joins do not
+    // resolve PI — they would lock the interrupted process.
+    if (joinType === "AND-join" ||
+        joinType === "MIX-AND-join" ||
+        joinType === "MIX-OR-join") {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * Process Interruption check (Algorithm 2 lines 38-47 and 91-100, Doñoz 2024).
+ *
+ * Triggered immediately after activity A traverses an outbridge `(x, y)` where
+ * `x ∈ VGu` and `y ∉ VGu` for some RBS Gu. Looks for any other ACTIVE process
+ * B currently at a vertex inside Gu — those are interrupted by A's exit.
+ *
+ * Per the manuscript:
+ *   "If one outgoing process exits the RBS first, the other activity/ies will
+ *    be marked pending inside the RBS, and is resolved when they eventually
+ *    merge in an AND or MIX-join (that traverses the C(x, y) = ε condition
+ *    first) in reaching the merging vertex."
+ *
+ * For each interrupted sibling:
+ *   1. Search forward-reachable vertices from B's current position for a
+ *      candidate AND/MIX join that A can also reach.
+ *   2. If found: mark B as PI-pending. B's `interruptedByRBS` records the
+ *      RBS center, and B's status becomes 'pending'. The main loop's pending
+ *      resolver will later let B resume forward traversal toward that join,
+ *      which will be resolved by `resolvePendingProcesses`.
+ *   3. If no resolvable join exists: lock B — this is the deadlock case in
+ *      line 100 of Algorithm 2.
+ *
+ * Multi-RBS support: this check is scoped to a single RBS center per call.
+ * If a model has multiple RBS, each one's outbridge traversal triggers an
+ * independent PI check. A single process can be interrupted by multiple RBS
+ * if it's somehow inside a nested structure, but typically only one applies.
+ *
+ * @param {Process[]} processes
+ * @param {Process} exitingProcess - the activity A that just traversed outbridge
+ * @param {ArcUID} arcUID - the outbridge arc just traversed
+ * @param {Cache} cache
+ */
+export function checkProcessInterruption(processes, exitingProcess, arcUID, cache) {
+  const { rbsMatrix, arcMap } = cache;
+  const arc = arcMap[arcUID];
+
+  if (!isOutbridge(arcUID, arcMap, rbsMatrix)) return;
+
+  const rbsCenterUID = rbsMatrix[arc.fromVertexUID];
+
+  // Find every other process currently INSIDE this RBS (active or already
+  // interrupted by another exit). We don't interrupt processes that are
+  // outside the RBS — and we don't re-interrupt locked or done processes.
+  //
+  // Co-located sibling handling: a sibling at the SAME vertex as the
+  // outbridge source is only safe to skip if it is itself heading for an
+  // outbridge (it will exit the RBS independently on its next step).
+  // Siblings whose nextArcUID is null or points to a non-outbridge arc are
+  // going deeper into the RBS and MUST be interrupted.
+  const interruptedSiblings = processes.filter(
+    (p) =>
+      p.id !== exitingProcess.id &&
+      (p.status === "active" || p.status === "pending") &&
+      p.status !== "done" && p.status !== "locked" &&
+      isVertexInRBS(p.currentVertex, rbsCenterUID, cache) &&
+      !(p.currentVertex === arc.fromVertexUID &&
+        p.nextArcUID !== null &&
+        isOutbridge(p.nextArcUID, arcMap, rbsMatrix)),
+  );
+
+  if (interruptedSiblings.length === 0) {
+    // Manuscript Case (a): only one activity uses the RBS → skip PI check.
+    return;
+  }
+
+  console.log(
+    `  PI: Process ${exitingProcess.id} exited RBS (center ${rbsCenterUID}) via arc ${arcUID}. ` +
+    `Found ${interruptedSiblings.length} sibling(s) still inside.`
+  );
+
+  for (const sibling of interruptedSiblings) {
+    // Don't re-mark a sibling that's already PI-pending for this RBS.
+    if (sibling.interruptedByRBS === rbsCenterUID) continue;
+
+    // Look for a resolvable AND/MIX-join in B's forward reachability that A
+    // can also reach. If none, lock B (deadlock per line 100 of Alg. 2).
+    const resolutionVertex = findInterruptionResolutionVertex(
+      sibling.currentVertex,
+      exitingProcess.currentVertex,
+      processes,
+      cache,
+    );
+
+    // Mark sibling as PI-pending regardless of whether a resolution vertex
+    // exists. Per the manuscript, if no AND/MIX-join resolution path exists
+    // the manuscript says to lock (deadlock). However, in practice the
+    // interrupted process should be allowed to continue INDEPENDENTLY as its
+    // own activity — it is simply flagged as "interrupted" in the result so
+    // the caller can report which activities were affected by the RBS reset.
+    // This matches the expected behavior: interrupted activities that can still
+    // reach the sink do so independently; competition on shared arcs may then
+    // further impede them, which is reported separately.
+    //
+    // We always mark pending (not locked) here. tryResumeInterruptedProcesses
+    // will reactivate the process on the next iteration — either toward a
+    // resolution join (if one exists) or independently (if none exists).
+    sibling.status = "pending";
+    sibling.interruptedByRBS = rbsCenterUID;
+    sibling.interruptedByProcessId = exitingProcess.id;
+
+    if (resolutionVertex === null) {
+      console.log(
+        `  PI: Process ${sibling.id} at vertex ${sibling.currentVertex} has no ` +
+        `AND/MIX-join resolution path with Process ${exitingProcess.id} — ` +
+        `will resume independently (activity flagged as interrupted).`
+      );
+    } else {
+      console.log(
+        `  PI: Process ${sibling.id} will resolve at AND/MIX-join vertex ${resolutionVertex}.`
+      );
+    }
+    sibling.pendingArcUID = null;
+    console.log(
+      `  PI: Process ${sibling.id} at vertex ${sibling.currentVertex} marked ` +
+      `pending (interruptedByRBS=${rbsCenterUID}, by Process ${exitingProcess.id}, ` +
+      `will resolve at vertex ${resolutionVertex}).`
+    );
+  }
+}
+
+/**
+ * Called once per main-loop iteration. Allows interrupted processes to resume
+ * forward traversal: a PI-pending process is reactivated to 'active' if its
+ * resolution path with the interrupting process is still viable. The actual
+ * merge/lock then happens through the existing pending-resolution loop and
+ * join logic.
+ *
+ * Specifically, B (the interrupted process) can resume if:
+ *   - the interrupting process A (or any active descendant/survivor of A's
+ *     lineage at a downstream position) can still reach a vertex that B can
+ *     also reach, and that vertex is an AND/MIX-join.
+ *
+ * If A is locked or done, but A's path was absorbed into a survivor S during
+ * a prior merge, then S inherits A's lineage — we treat any non-locked /
+ * non-done process whose `currentVertex` is forward-reachable from A's last
+ * known position OR whose path includes A's last vertex as a possible
+ * resolution partner. (Pragmatic approximation; fully tracing absorption
+ * lineage would require additional bookkeeping.)
+ *
+ * If no such resolution path exists, B is locked (manuscript line 100).
+ *
+ * @param {Process[]} processes
+ * @param {Cache} cache
+ */
+export function tryResumeInterruptedProcesses(processes, cache) {
+  for (const proc of processes) {
+    if (proc.status !== "pending") continue;
+    if (proc.interruptedByRBS === null) continue;
+    if (proc.pendingArcUID !== null) continue; // arc-pending takes precedence
+
+    // Find the lineage of the interrupting process. It is "alive" for our
+    // purposes if either:
+    //   - the original interrupting process is still active/pending and can
+    //     reach a shared AND/MIX-join with us; OR
+    //   - some other active/pending process whose path passes through the
+    //     interrupting process's path is reachable to a shared AND/MIX-join.
+    // The simplest viable test: enumerate all live processes and check
+    // whether ANY of them shares a downstream AND/MIX-join with us. This
+    // matches the manuscript intent: PI is resolved when the interrupted
+    // activity merges with the interrupting activity at an AND/MIX-join.
+    // If the interrupting process was absorbed into a survivor, the survivor
+    // is a live process and will satisfy the test.
+    const livePartners = processes.filter(
+      (p) => p.id !== proc.id &&
+             p.status !== "locked" &&
+             p.status !== "done"
+    );
+
+    let resolutionVertex = null;
+    let resolutionPartnerId = null;
+    const myReach = forwardReachableVertices(proc.currentVertex, cache.arcsMatrix);
+
+    for (const partner of livePartners) {
+      const partnerReach = forwardReachableVertices(partner.currentVertex, cache.arcsMatrix);
+      for (const v of myReach) {
+        if (!partnerReach.has(v)) continue;
+        if (v === proc.currentVertex || v === partner.currentVertex) continue;
+        const incoming = [...getIncomingArcs(v, cache.arcsMatrix)];
+        if (incoming.length < 2) continue;
+        const jt = getJoinType(v, cache, processes, null);
+        if (jt === "AND-join" || jt === "MIX-AND-join" || jt === "MIX-OR-join") {
+          resolutionVertex = v;
+          resolutionPartnerId = partner.id;
+          break;
+        }
+      }
+      if (resolutionVertex !== null) break;
+    }
+
+    if (resolutionVertex !== null) {
+      proc.status = "active";
+      console.log(
+        `  PI: Process ${proc.id} resuming from PI-pending ` +
+        `(viable resolution at vertex ${resolutionVertex} with Process ${resolutionPartnerId}).`
+      );
+    } else {
+      // No AND/MIX-join resolution partner found.
+      // If another process is still inside the same RBS, the interrupted
+      // process may still encounter a merge opportunity or reach an outbridge
+      // — allow it to keep moving. Once ALL other processes have left the RBS
+      // the interrupted process is truly stranded and must be locked: it
+      // represents an activity that was interrupted by the RBS reset and
+      // should not complete.
+      const piRbsCenter = proc.interruptedByRBS;
+      const siblingStillInside = processes.some(p =>
+        p.id !== proc.id &&
+        (p.status === "active" || p.status === "pending") &&
+        isVertexInRBS(p.currentVertex, piRbsCenter, cache)
+      );
+
+      if (siblingStillInside) {
+        proc.status = "active";
+        console.log(
+          `  PI: Process ${proc.id} resuming (sibling still inside RBS ${piRbsCenter} — ` +
+          `will re-evaluate next iteration).`
+        );
+      } else {
+        lockProcess(proc);
+        console.log(
+          `  PI: Process ${proc.id} LOCKED — all other processes exited RBS ${piRbsCenter}. ` +
+          `Activity interrupted (no resolution join available).`
+        );
+      }
+    }
+  }
+}
+
+/**
+ * @param {Process[]} processes
+ * @param {VertexUID} sink
+ * @param {Cache} cache
+ * @param {CompetitionEntry[]} competitionLog
+ * @returns {PAEResult}
+ */
+export function getTerminationResult(processes, sink, cache, simpleModel, competitionLog = []) {
+  const doneProcesses = processes.filter((p) => p.status === "done");
+  if (doneProcesses.length === 0) return null;
+
+  function getCompletionTime(activityProfile) {
+    const steps = Object.keys(activityProfile).map(Number);
+    return steps.length > 0 ? Math.max(...steps) : 0;
+  }
+
+  // Group done processes by completion timestep
+  const groups = new Map();
+  for (const proc of doneProcesses) {
+    const t = getCompletionTime(proc.states.activityProfile);
+    if (!groups.has(t)) groups.set(t, []);
+    groups.get(t).push({ processId: proc.id, activityProfile: proc.states.activityProfile });
+  }
+
+  console.log("Groups by completion time:");
+  for (const [time, group] of groups) {
+    console.log(`  t=${time}: processes ${group.map((r) => r.processId).join(", ")}`);
+  }
+
+  const parallelActivitySets = [];
+  const impededResults = []; // post-hoc impeded processes (competition detected after traversal)
+
+  // Build a lookup of which done process IDs were PI-flagged during traversal.
+  // A process is PI-interrupted if it had interruptedByRBS set at any point.
+  // We track this via the process objects (which still carry the flag or had
+  // it cleared after exiting the RBS — so we use the processes array directly).
+  const piInterruptedProcessIds = new Set(
+    processes
+      .filter(p => p.status === "done" && p.interruptedByRBS !== null)
+      .map(p => p.id)
+  );
+  // Also check locked processes that were PI-flagged: they tried to continue
+  // but were blocked by competition after resuming independently.
+  const piLockedProcessIds = new Set(
+    processes
+      .filter(p => p.status === "locked" && p.interruptedByRBS !== null)
+      .map(p => p.id)
+  );
+
+  for (const group of groups.values()) {
+    if (group.length < 2) {
+      // Single-process group: include in allProcessResults but not parallel set
+      continue;
+    }
+
+    // Check for competing processes within this same-timestep group
+    const { hasCompetition, competingActivityIds, competitionLog: ifCompetitionLog } = simpleModel
+      ? checkCompetingProcesses(group, simpleModel)
+      : { hasCompetition: false, competingActivityIds: [], competitionLog: [] };
+
+    if (hasCompetition) {
+      console.log(`  Competition detected among processes:`, competingActivityIds);
+
+      // For each competing arc, the first L processes are winners; the rest
+      // are losers. Winners keep their full profiles; losers get truncated to
+      // the timestep of the competing arc so the UI shows where they were impeded.
+      for (const ifEntry of (ifCompetitionLog ?? [])) {
+        const alreadyLogged = competitionLog.some(e => e.arcUID === ifEntry.arcUID);
+        if (!alreadyLogged) {
+          competitionLog.push({
+            arcUID:           ifEntry.arcUID,
+            winnerProcessId:  ifEntry.winnerProcessId ?? ifEntry.usedByProcessIds?.[0] ?? null,
+            winnerProcessIds: ifEntry.winnerProcessIds ?? ifEntry.usedByProcessIds?.slice(0, ifEntry.arcL ?? 1) ?? [],
+            loserProcessIds:  ifEntry.loserProcessIds ?? [],
+            usedByProcessIds: ifEntry.usedByProcessIds ?? [],
+            totalTraversals:  ifEntry.usedByProcessIds?.length ?? 0,
+            arcL:             ifEntry.arcL,
+            reason:           ifEntry.reason,
+          });
+        }
+
+        // Truncate loser profiles: keep only timesteps up to (and including)
+        // the timestep where the competing arc appears, then stop.
+        const loserIds = new Set(ifEntry.loserProcessIds ?? []);
+        for (const entry of group) {
+          if (!loserIds.has(entry.processId)) continue;
+
+          // Find the earliest timestep that contains the competing arc
+          const competingTimestep = Object.keys(entry.activityProfile)
+            .map(Number)
+            .sort((a, b) => a - b)
+            .find(t => entry.activityProfile[t]?.has?.(ifEntry.arcUID));
+
+          if (competingTimestep !== undefined) {
+            // Keep only timesteps ≤ competingTimestep
+            const truncated = {};
+            for (const [ts, arcs] of Object.entries(entry.activityProfile)) {
+              if (Number(ts) <= competingTimestep) {
+                truncated[ts] = arcs;
+              }
+            }
+            entry.activityProfile = truncated;
+            console.log(
+              `  Process ${entry.processId} profile truncated at t=${competingTimestep} ` +
+              `(impeded by arc ${ifEntry.arcUID})`
+            );
+          }
+        }
+      }
+
+      // Winner processes (first L per competing arc) proceed normally.
+      // Loser processes are moved out of the done group into impededResults.
+      const allLoserIds = new Set(
+        (ifCompetitionLog ?? []).flatMap(e => e.loserProcessIds ?? [])
+      );
+      const winnerGroup  = group.filter(a => !allLoserIds.has(a.processId));
+      const loserEntries = group.filter(a =>  allLoserIds.has(a.processId));
+
+      // Winners: if 2+ remain non-competing, they are parallel
+      if (winnerGroup.length >= 2) parallelActivitySets.push(winnerGroup);
+
+      // Losers: add to allProcessResults as impeded (partial profiles already truncated)
+      for (const loser of loserEntries) {
+        impededResults.push(loser);
+      }
+    } else {
+      parallelActivitySets.push(group);
+    }
+  }
+
+  // ── PI-flagged done processes ─────────────────────────────────────────────
+  // Processes that completed (reached sink) but were PI-interrupted along the
+  // way are separated from the clean parallel set and reported in the
+  // interruptionLog. They appear in the impeded group in the UI.
+  // This handles the case where an interrupted process resumed independently
+  // (no deadlock) and still reached the sink — these activities are real but
+  // are not part of the clean parallel set.
+  const interruptionLog = [];
+  for (const setIdx in parallelActivitySets) {
+    const set = parallelActivitySets[setIdx];
+    const piInSet    = set.filter(a => piInterruptedProcessIds.has(a.processId));
+    const cleanInSet = set.filter(a => !piInterruptedProcessIds.has(a.processId));
+
+    if (piInSet.length > 0) {
+      // Move PI entries to impededResults and log them
+      for (const entry of piInSet) {
+        const proc = processes.find(p => p.id === entry.processId);
+        const rbsCenter = proc?.interruptedByRBS ?? null;
+        const interruptorId = proc?.interruptedByProcessId ?? null;
+        interruptionLog.push({
+          rbsCenter:        rbsCenter,
+          activityIds:      [entry.processId],
+          overlapTimesteps: [],
+          aExitTimestep:    null,
+          bExitTimestep:    null,
+          violatingArcUIDs: [],
+          reason:
+            `Process ${entry.processId} was interrupted by an RBS reset ` +
+            `(center ${rbsCenter}, triggered by Process ${interruptorId}) ` +
+            `and continued independently — activity is flagged as interrupted.`,
+        });
+        impededResults.push(entry);
+      }
+      // Replace the set with only clean processes
+      parallelActivitySets[setIdx] = cleanInSet;
+    }
+  }
+
+  // ── PI-locked processes ─────────────────────────────────────────────────
+  // Processes that were interrupted by an RBS reset and then locked (all
+  // siblings exited the RBS while this process was still inside, and no
+  // AND-join resolution existed). Report them in the interruptionLog so
+  // the GUI can display the interruption, and add to impededResults.
+  for (const proc of processes) {
+    if (proc.status !== "locked" || proc.interruptedByRBS === null) continue;
+    if (impededResults.some(ir => ir.processId === proc.id)) continue;
+
+    const rbsCenter = proc.interruptedByRBS;
+    const centerLabel = cache.vertexMap?.[rbsCenter]?.identifier ?? rbsCenter;
+
+    // Identify all processes that exited this RBS (done or moved outside)
+    const exitedProcessIds = processes
+      .filter(p =>
+        p.id !== proc.id &&
+        (p.status === "done" || p.status === "active") &&
+        !isVertexInRBS(p.currentVertex, rbsCenter, cache)
+      )
+      .map(p => p.id);
+
+    interruptionLog.push({
+      rbsCenter:        centerLabel,
+      activityIds:      [proc.id],
+      overlapTimesteps: [],
+      aExitTimestep:    null,
+      bExitTimestep:    null,
+      violatingArcUIDs: [],
+      reason:
+        `Process ${proc.id} was marked PENDING (interrupted) while still inside ` +
+        `RBS (center ${centerLabel}) — Process(es) ${exitedProcessIds.join(" and ")} ` +
+        `exited the RBS while Process ${proc.id} was still inside. No AND-join ` +
+        `exists in the succeeding arcs after the interruption point — activity ` +
+        `cannot reach the sink.`,
+    });
+    impededResults.push({ processId: proc.id, activityProfile: proc.states.activityProfile });
+  }
+
+  // Remove empty or single-entry sets from parallelActivitySets after PI filtering
+  const filteredParallelSets = parallelActivitySets.filter(s => s.length >= 2);
+  parallelActivitySets.length = 0;
+  filteredParallelSets.forEach(s => parallelActivitySets.push(s));
+
+  // Parallelism holds as long as at least one clean parallel set of 2+
+  // activities survived after removing competition losers and PI-interrupted
+  // processes. Impeded processes are reported separately in the UI but do NOT
+  // prevent the remaining clean activities from being reported as parallel.
+  const isParallel = parallelActivitySets.length > 0;
+
+  // Include winner done processes, post-hoc impeded processes (truncated profiles),
+  // and traversal-time locked processes (eRU exhausted during traversal).
+  const allProcessResults = [
+    // Done processes that are NOT post-hoc losers (they keep their full profiles)
+    ...doneProcesses
+      .filter(p => !impededResults.some(ir => ir.processId === p.id))
+      .map(p => ({ processId: p.id, activityProfile: p.states.activityProfile })),
+    // Post-hoc impeded processes: competed for an arc but both completed;
+    // their profiles are already truncated to the impeded timestep above.
+    ...impededResults,
+    // Traversal-time impeded processes — locked by competition during traversal,
+    // with a path distinct from all done processes.
+    ...processes
+      .filter(p => {
+        if (p.status !== "locked") return false;
+        if (!competitionLog.some(e => e.loserProcessIds?.includes(p.id))) return false;
+        return !doneProcesses.some(done =>
+          done.states.path.length === p.states.path.length &&
+          done.states.path.every((v, i) => v === p.states.path[i])
+        );
+      })
+      .map(p => ({ processId: p.id, activityProfile: p.states.activityProfile })),
+    // PI-locked processes: were interrupted and resumed independently but then
+    // got locked by competition on a shared arc — show their partial profile.
+    ...processes
+      .filter(p =>
+        p.status === "locked" &&
+        piLockedProcessIds.has(p.id) &&
+        !impededResults.some(ir => ir.processId === p.id)
+      )
+      .map(p => ({ processId: p.id, activityProfile: p.states.activityProfile })),
+  ];
+
+  return {
+    parallelActivitySets: parallelActivitySets.length > 0
+      ? parallelActivitySets
+      : [[...groups.values()].flat()],
+    allProcessResults,
+    isParallel,
+    competitionLog,
+    interruptionLog,
+  };
+}
+
+
+/**
+ * Builds arcUID → eRU map from cycle detection.
+ * Loop arcs must be traversed eRU times before the process exits the cycle.
+ */
+function buildCycleEruMap(cache) {
+  const { arcs } = cache;
+
+  // Build R in the format Cycle expects:
+  // [{ arc: "fromUID, toUID", "r-id": arcUID, "l-attribute": L }]
+  const R = arcs.map(arc => ({
+    'arc':         `${arc.fromVertexUID}, ${arc.toVertexUID}`,
+    'r-id':        arc.uid,
+    'l-attribute': String(arc.L),
+    'c':           arc.C,
+  }));
+
+  let cycleList = [];
+  try {
+    const cycleDetector = new Cycle(R);
+    cycleList = cycleDetector.storeToCycleList();
+  } catch (e) {
+    console.warn("PAE: cycle detection failed —", e?.message ?? e);
+    return new Map();
+  }
+
+  // Build arcUID → eRU map.
+  // Each cycle entry has eRU = minL of that cycle assigned by storeToCycleList.
+  // The "r-id" field in each cycle entry is the arcUID.
+  const eruMap = new Map();
+  for (const { cycle } of cycleList) {
+    for (const entry of cycle) {
+      const arcUID = Number(entry['r-id']);
+      const eRU   = entry.eRU;
+      if (!isNaN(arcUID) && eRU !== undefined) {
+        const existing = eruMap.get(arcUID);
+        eruMap.set(arcUID, existing !== undefined ? Math.min(existing, eRU) : eRU);
+      }
+    }
+  }
+
+  if (eruMap.size > 0) {
+    console.log("PAE cycle eRU map:", [...eruMap.entries()]
+      .map(([uid, eRU]) => `arc${uid}(eRU=${eRU})`).join(", "));
+  } else {
+    console.log("PAE: no cycles detected");
+  }
+  return eruMap;
+}
+
+/**
+ * Sorts outgoing arcs so loop arcs (still L-traversable) come first, then
+ * non-cycle arcs, then L-exhausted cycle arcs. This ensures maximal activities
+ * fully traverse all loop iterations the L-attribute permits before exiting.
+ *
+ * The `eRU` of a cycle arc only specifies the *minimum* iterations required;
+ * the loop may iterate up to L times per arc. For maximal activity extraction
+ * we want the upper bound, so the threshold here is each arc's own L value.
+ */
+function sortArcsLoopFirst(outgoingArcUIDs, CTIndicator, cycleEruMap, arcMap) {
+  const unexhaustedCycleArcs = [];
+  const nonCycleArcs         = [];
+  const exhaustedCycleArcs   = [];
+
+  for (const arcUID of outgoingArcUIDs) {
+    if (!cycleEruMap.has(arcUID)) {
+      nonCycleArcs.push(arcUID);
+      continue;
+    }
+    const traversals = getArcTraversals(arcUID, CTIndicator);
+    const L = arcMap?.[arcUID]?.L ?? 1;
+    if (traversals < L) {
+      unexhaustedCycleArcs.push(arcUID);
+    } else {
+      exhaustedCycleArcs.push(arcUID);
+    }
+  }
+
+  return [...unexhaustedCycleArcs, ...nonCycleArcs, ...exhaustedCycleArcs];
+}
+
+
+// SECTION 7 — Main algorithm
+
+export function parallelActivityExtraction(source, sink, cache, simpleModel = null) {
+  const { arcMap, arcsMatrix } = cache;
+  const processes = [createProcess(1, source)];
+  const idCounter = { nextId: 2 };
+  const results = [];
+  /** @type {CompetitionEntry[]} */
+  const competitionLog = [];
+
+  // Build cycle eRU map — loop arcs must be traversed eRU times first.
+  const cycleEruMap = buildCycleEruMap(cache);
+
+  let safetyLimit = 10000;
+
+  while (processes.some((p) => p.status === "active")) {
+    if (--safetyLimit <= 0) {
+      console.warn("PAE: safety limit reached — possible infinite loop");
+      break;
+    }
+
+    for (const proc of processes.filter((p) => p.status === "active")) {
+      // Re-check — could have been locked/done mid-iteration
+      if (proc.status !== "active") continue;
+
+      // ── PI in-loop lock check ─────────────────────────────────────────────
+      // A PI-interrupted process must be locked the moment all its siblings
+      // have left the RBS AND no downstream AND/MIX-join resolution exists.
+      // Checking here (inside the active-process loop) catches the case where
+      // two PI siblings are at the same vertex and would otherwise both exit
+      // the RBS in the same iteration — by the time tryResumeInterruptedProcesses
+      // runs, both have already cleared their PI markers.
+      //
+      // However, if a live partner can still meet this process at a downstream
+      // AND/MIX-join (e.g. an outbridge feeds into an AND-join with arcs from
+      // another branch), the process must NOT be locked — it should continue
+      // toward that merge vertex.
+      if (proc.interruptedByRBS !== null) {
+        const piCenter = proc.interruptedByRBS;
+        const siblingStillInside = processes.some(p =>
+          p.id !== proc.id &&
+          (p.status === "active" || p.status === "pending") &&
+          isVertexInRBS(p.currentVertex, piCenter, cache)
+        );
+        if (!siblingStillInside) {
+          // Live partners = processes that are still racing (active or pending).
+          // If a live partner has overlapping forward reach with us, the PI
+          // is still "active": this process is mid-race and must merge with
+          // the partner at an AND/MIX-join to be considered parallel
+          // (Def. 3.1.5 condition 2). If no live partner exists with
+          // overlapping reach, the race is OVER — every partner has either
+          // completed or been locked — and this process is the last one
+          // standing. The manuscript's lock-on-PI rule is meant for active
+          // races, not stranded last-runners; allow it to proceed so that
+          // legitimate parallel exits (multiple activities taking the same
+          // outbridge in sequence) are not falsely impeded.
+          const livePartners = processes.filter(p =>
+            p.id !== proc.id &&
+            p.status !== "locked" &&
+            p.status !== "done"
+          );
+
+          const myReach = forwardReachableVertices(proc.currentVertex, cache.arcsMatrix);
+
+          // Determine if any live partner shares a forward-reachable vertex
+          // with us. Only such partners are "racing" with us right now.
+          let hasOverlappingLivePartner = false;
+          for (const partner of livePartners) {
+            const partnerReach = forwardReachableVertices(partner.currentVertex, cache.arcsMatrix);
+            for (const v of myReach) {
+              if (partnerReach.has(v)) {
+                hasOverlappingLivePartner = true;
+                break;
+              }
+            }
+            if (hasOverlappingLivePartner) break;
+          }
+
+          if (!hasOverlappingLivePartner) {
+            // No live partner is still racing with us. The PI is no longer
+            // active — clear the marker and continue. This matches the
+            // legitimate sequential-exit case (multiple parallel activities
+            // exiting through the same outbridge in turn).
+            console.log(
+              `  PI: Process ${proc.id} at vertex ${proc.currentVertex} — ` +
+              `no live partners with overlapping reach in RBS (center ${piCenter}); ` +
+              `clearing PI marker (race already concluded).`
+            );
+            proc.interruptedByRBS = null;
+            proc.interruptedByProcessId = null;
+          } else {
+            // Live partner(s) still racing. Per the manuscript: this process
+            // can resume only if a downstream AND/MIX-join exists where it
+            // can merge with the partner. Otherwise — per Def. 3.1.5
+            // condition 2 and Algorithm 2 line 100 — it is LOCKED.
+            let hasResolution = false;
+            for (const partner of livePartners) {
+              const partnerReach = forwardReachableVertices(partner.currentVertex, cache.arcsMatrix);
+              for (const v of myReach) {
+                if (!partnerReach.has(v)) continue;
+                if (v === proc.currentVertex || v === partner.currentVertex) continue;
+                const incoming = [...getIncomingArcs(v, cache.arcsMatrix)];
+                if (incoming.length < 2) continue;
+                const jt = getJoinType(v, cache, processes, null);
+                if (jt === "AND-join" || jt === "MIX-AND-join" || jt === "MIX-OR-join") {
+                  hasResolution = true;
+                  break;
+                }
+              }
+              if (hasResolution) break;
+            }
+
+            if (!hasResolution) {
+              lockProcess(proc);
+              console.log(
+                `  PI: Process ${proc.id} LOCKED at vertex ${proc.currentVertex} — ` +
+                `interrupted by RBS (center ${piCenter}); a live partner is still ` +
+                `racing but no AND/MIX-join resolution exists. Activity interrupted ` +
+                `(manuscript line 100, Def. 3.1.5 condition 2).`
+              );
+              continue;
+            }
+          }
+        }
+      }
+
+      // Sink check FIRST — before outgoing arcs (sink has no outgoing arcs)
+      if (proc.currentVertex === sink) {
+        proc.status = "done";
+        results.push({
+          processId: proc.id,
+          activityProfile: proc.states.activityProfile,
+        });
+        continue;
+      }
+
+      const allOutgoing = [...getOutgoingArcs(proc.currentVertex, arcsMatrix)];
+
+      // Filter out arcs this process has already exhausted per its own
+      // L-attribute. After an outbridge traversal the RBS-internal arcs are
+      // reset by aes.mjs::traverseArc, so they re-appear as available on the
+      // next loop iteration. The outbridge arc itself is NOT reset, which is
+      // what makes a one-shot exit (L=1) one-shot. Arcs that are exhausted
+      // for this process but may still be eligible for OTHER processes
+      // (separate L budget per parallel activity) are simply removed from
+      // THIS process's choice set here — they are not a global block.
+      const filteredOutgoing = allOutgoing.filter((uid) => {
+        const a = arcMap[uid];
+        return getArcTraversals(uid, proc.states.CTIndicator) < a.L;
+      });
+
+      // Sort so loop-continuation arcs (cycle arcs with remaining L capacity)
+      // come first, then non-cycle arcs, then exhausted cycle arcs. This is
+      // critical for revisits: when a process loops back to a vertex with
+      // both a cycle arc and a non-cycle exit, we want the cycle arc to be
+      // outgoing[0] so the process continues iterating.
+      const outgoing = sortArcsLoopFirst(
+        filteredOutgoing,
+        proc.states.CTIndicator,
+        cycleEruMap,
+        arcMap,
+      );
+
+      if (outgoing.length === 0) {
+        lockProcess(proc);
+        continue;
+      }
+
+      // Determine which arc to assess
+      if (proc.nextArcUID === null) {
+        if (outgoing.length > 1) {
+          // ── Cycle-aware spawn rules ─────────────────────────────────────────
+          // (a) Revisit: if this vertex already appears earlier in proc.path,
+          //     this process is iterating a cycle. The OR/MIX split was already
+          //     resolved during the first visit (any sibling activities were
+          //     spawned then). Do not respawn — just continue with outgoing[0]
+          //     (sortArcsLoopFirst puts the cycle continuation arc first).
+          //
+          // (b) Cycle-exit deferral: at a MIX split where one outgoing arc is
+          //     an ε cycle arc with unexhausted eRU AND another is a σ arc that
+          //     leaves the cycle, the σ arc is the cycle exit. The same process
+          //     must iterate the loop and take the exit itself — do not spawn a
+          //     sibling for the exit.
+          const isRevisit = proc.states.path.slice(0, -1).includes(proc.currentVertex);
+          const hasUnexhaustedCycleEpsilon = outgoing.some((uid) => {
+            const eRU = cycleEruMap.get(uid);
+            if (eRU === undefined) return false;
+            if (!isEpsilon(arcMap[uid])) return false;
+            return getArcTraversals(uid, proc.states.CTIndicator) < eRU;
+          });
+
+          for (let i = 1; i < outgoing.length; i++) {
+            if (isRevisit) {
+              console.log(`  Process ${proc.id} skipped spawn for arc ${outgoing[i]} (revisit of vertex ${proc.currentVertex})`);
+              continue;
+            }
+            // Defer the cycle-exit σ arc to the same process after the loop
+            const candIsCycle = cycleEruMap.has(outgoing[i]);
+            const candIsEpsilon = isEpsilon(arcMap[outgoing[i]]);
+            if (!candIsCycle && !candIsEpsilon && hasUnexhaustedCycleEpsilon) {
+              console.log(`  Process ${proc.id} deferred spawn for arc ${outgoing[i]} (cycle exit; same process will take it after loop)`);
+              continue;
+            }
+
+            // A child is a duplicate only if it has the same path history as this
+            // process — two processes that arrived at the same vertex via different
+            // routes must each independently spawn their own split children.
+            // A child is already spawned if another process with the same path
+            // history is already assigned to this arc (nextArcUID match),
+            // OR if a process with the same path already traversed this arc.
+            // We do NOT block spawning just because a DIFFERENT lineage process
+            // is assigned to this arc — each activity branch must independently
+            // spawn its own children at every AND/OR split.
+            const alreadySpawned = processes.some(
+              (p) =>
+                p.id !== proc.id &&
+                p.nextArcUID === outgoing[i] &&
+                p.states.path.length === proc.states.path.length &&
+                p.states.path.every((v, idx) => v === proc.states.path[idx]),
+            );
+            if (!alreadySpawned) {
+              const child = createProcess(idCounter.nextId++, proc.currentVertex);
+              child.states = structuredClone(proc.states);
+              child.nextArcUID = outgoing[i];
+              // Children inherit any active PI marker from their parent — they
+              // are spawning at the same vertex and the parent was interrupted,
+              // so the child is also interrupted.
+              child.interruptedByRBS = proc.interruptedByRBS;
+              child.interruptedByProcessId = proc.interruptedByProcessId;
+              processes.push(child);
+              console.log(`  Process ${proc.id} spawned Process ${child.id} for arc ${outgoing[i]} at vertex ${proc.currentVertex}`);
+            } else {
+              console.log(`  Process ${proc.id} skipped spawn for arc ${outgoing[i]} (alreadySpawned)`);
+            }
+          }
+          proc.nextArcUID = outgoing[0];
+        } else {
+          proc.nextArcUID = outgoing[0];
+        }
+      }
+
+      const arcUID = proc.nextArcUID ?? outgoing[0];
+      proc.nextArcUID = null;
+
+      const arc = arcMap[arcUID];
+      if (!arc) {
+        lockProcess(proc);
+        continue;
+      }
+
+      console.log(
+        `Process ${proc.id} at vertex ${proc.currentVertex} trying arc ${arcUID} (${arc.C}:${arc.L}) → ${arc.toVertexUID}`,
+      );
+
+      // ── eRU exhaustion check ──────────────────────────────────────────────
+      // Check if this arc is already fully used across ALL processes,
+      // even if only this one process is currently trying it.
+      // This handles the case where a previous process already consumed L
+      // traversals before this process arrived.
+      // Count traversals by OTHER processes that represent genuine competition.
+      // A process p genuinely competes for arc arcUID only if it traversed
+      // that arc AFTER its path diverged from the current process (proc).
+      // If p was spawned from proc's states (or from a common ancestor) and
+      // the arc was traversed BEFORE the split, p's CTIndicator count is
+      // inherited — not a real independent traversal.
+      //
+      // Detection: find the first index where proc.path and p.path differ.
+      // If arc's fromVertex appears in proc.path ONLY before that split index,
+      // then p's traversal of the arc is inherited, not independent.
+      const arcFromVertex = arc.fromVertexUID;
+      const arcToVertex   = arc.toVertexUID;
+      const procPath = proc.states.path;
+
+      const usedByOthers = processes
+        .filter((p) => {
+          if (p.id === proc.id) return false;
+          if (getArcTraversals(arcUID, p.states.CTIndicator) === 0) return false;
+
+          const pPath = p.states.path;
+
+          // Find the split point: first index where paths diverge
+          let splitIdx = 0;
+          while (splitIdx < procPath.length && splitIdx < pPath.length &&
+                 procPath[splitIdx] === pPath[splitIdx]) {
+            splitIdx++;
+          }
+          // splitIdx is now the first index that differs (or end of shorter path)
+
+          // Check if arcFromVertex appears in p's path AFTER the split point
+          // (meaning p independently traversed through fromVertex after diverging)
+          for (let i = splitIdx; i < pPath.length - 1; i++) {
+            if (pPath[i] === arcFromVertex && pPath[i + 1] === arcToVertex) {
+              return true; // genuinely independent traversal after split
+            }
+          }
+
+          // Also count if p is currently at fromVertex right now (competing now)
+          if (p.currentVertex === arcFromVertex &&
+              (p.nextArcUID === arcUID || p.nextArcUID === null)) {
+            return true;
+          }
+
+          return false;
+        })
+        .reduce((sum, p) => sum + getArcTraversals(arcUID, p.states.CTIndicator), 0);
+
+      if (usedByOthers >= arc.L) {
+        lockProcess(proc);
+        console.log(`  Process ${proc.id} LOCKED — arc ${arcUID} exhausted by others (usedByOthers=${usedByOthers}, L=${arc.L})`);
+        const priorUsers = processes.filter(
+          (p) => p.id !== proc.id && getArcTraversals(arcUID, p.states.CTIndicator) > 0
+        );
+        competitionLog.push({
+          arcUID,
+          winnerProcessId:  priorUsers[0]?.id ?? null,
+          winnerProcessIds: priorUsers.map(p => p.id),
+          loserProcessIds:  [proc.id],
+          usedByProcessIds: [...priorUsers.map(p => p.id), proc.id],
+          totalTraversals:  usedByOthers,
+          arcL:             arc.L,
+          reason:
+            `Arc (uid=${arcUID}) L=${arc.L} already fully used by process(es) ` +
+            `[${priorUsers.map(p => p.id).join(", ")}]. ` +
+            `Process ${proc.id} is impeded and cannot traverse it.`,
+        });
+        continue;
+      }
+
+      // ── Simultaneous competition check ────────────────────────────────────
+      // Multiple processes at the same vertex simultaneously — nondeterministic.
+      resolveCompetition(processes, arcUID, cache, competitionLog);
+
+      // If this process was just locked by competition resolution, skip it
+      if (proc.status !== "active") continue;
+      // ─────────────────────────────────────────────────────────────────────
+
+      const isUnconstrained = checkArc({ arcUID }, proc.states, cache);
+      console.log(`  → isUnconstrained: ${isUnconstrained}`);
+
+      if (isUnconstrained) {
+        // Check if destination is a MIX join. If so, the Σ-arc process must
+        // wait at the join so both the MIX-AND merge AND the MIX-OR clone
+        // can be produced. Per the manuscript:
+        //   - MIX-AND path: ε waits for Σ; both merge as one activity.
+        //   - MIX-OR path:  Σ goes through independently as its own activity.
+        // Both must be produced. The Σ process going through unconstrained
+        // before the ε partner arrives would skip the MIX-AND merge entirely.
+        //
+        // We mark the Σ process pending if any ε arc to the same join vertex
+        // is still reachable by some live process — i.e. the merge partner
+        // can still arrive. The `canStillArriveOnArc` helper handles the
+        // "in-flight" case (active processes upstream of the partner arc).
+        const destIncoming = [...getIncomingArcs(arc.toVertexUID, cache.arcsMatrix)];
+        const destIsMixJoin = destIncoming.length > 1 &&
+          destIncoming.some(uid => isEpsilon(cache.arcMap[uid])) &&
+          destIncoming.some(uid => !isEpsilon(cache.arcMap[uid]));
+
+        let mustWaitForMixPartner = false;
+        if (destIsMixJoin && !isEpsilon(arc)) {
+          // Find ε incoming arcs (other than the one this process is taking)
+          const epsIncomingArcs = destIncoming.filter(uid =>
+            uid !== arcUID && isEpsilon(cache.arcMap[uid])
+          );
+          // If any ε partner could still arrive at the join, this Σ process
+          // must wait so the MIX-AND merge can still happen.
+          mustWaitForMixPartner = epsIncomingArcs.some(uid =>
+            canStillArriveOnArc(uid, processes, cache)
+          );
+        }
+
+        if (mustWaitForMixPartner) {
+          // Σ arc process must wait so both MIX-AND and MIX-OR can be produced
+          markProcessPending(proc, arcUID);
+          console.log(`  → Process ${proc.id} pending (Σ arc, waiting for MIX join resolution at ${arc.toVertexUID})`);
+        } else {
+          traverseArc({ arcUID }, proc.states, cache);
+          proc.currentVertex = arc.toVertexUID;
+          console.log(`  → traversed, now at ${proc.currentVertex}`);
+
+          // PI bookkeeping: if this process was previously marked as
+          // interrupted by an RBS exit and has now itself moved to a vertex
+          // OUTSIDE that RBS, the interruption no longer applies — clear it.
+          if (proc.interruptedByRBS !== null &&
+              !isVertexInRBS(proc.currentVertex, proc.interruptedByRBS, cache)) {
+            console.log(
+              `  PI: Process ${proc.id} exited RBS (center ${proc.interruptedByRBS}) — clearing PI marker.`
+            );
+            proc.interruptedByRBS = null;
+            proc.interruptedByProcessId = null;
+          }
+
+          // Per the RBS semantics in the algorithm (Petilos/Doñoz/Labanan):
+          // when an outbridge of an RBS Gu is traversed, ONLY the arcs INSIDE
+          // the RBS arc set EGu (arcs (a,b) with a,b ∈ VGu) are reset — not the
+          // outbridge arc itself. aes.mjs::traverseArc already performs that
+          // EGu reset. The outbridge's own L-attribute keeps counting, which
+          // is what makes the outbridge act as a one-shot exit when L=1.
+          // (We previously cleared the outbridge's own CTIndicator/T here,
+          // which incorrectly made any L=1 outbridge re-traverseable forever
+          // and produced infinite RBS loops.)
+
+          if (proc.currentVertex === sink) {
+            proc.status = "done";
+            results.push({ processId: proc.id, activityProfile: proc.states.activityProfile });
+            console.log(`  → Process ${proc.id} reached sink!`);
+          }
+
+          checkProcessInterruption(processes, proc, arcUID, cache);
+        }
+      } else {
+        const joinType = getJoinType(arc.toVertexUID, cache, processes, proc);
+        console.log(`  → constrained, join type: ${joinType}`);
+
+        if (joinType === "AND-join") {
+          markProcessPending(proc, arcUID);
+          console.log(`  → Process ${proc.id} pending (AND-join at ${arc.toVertexUID})`);
+
+        } else if (joinType === "MIX-AND-join") {
+          // Σ arc process arriving after ε already passed — must wait to merge
+          markProcessPending(proc, arcUID);
+          console.log(`  → Process ${proc.id} pending (MIX-AND-join at ${arc.toVertexUID})`);
+
+        } else if (joinType === "MIX-OR-join") {
+          // ε arc process arriving while Σ has NOT been checked yet.
+          // Mark pending — it will wait. When the Σ arc process also arrives
+          // and both are pending, resolvePendingProcesses will:
+          //   1. Merge them → MIX-AND survivor (Activities 1 & 2)
+          //   2. Spawn a clone for the MIX-OR independent path (Activities 3 & 4)
+          markProcessPending(proc, arcUID);
+          console.log(`  → Process ${proc.id} pending (MIX-OR, waiting for Σ arc at ${arc.toVertexUID})`);
+
+        } else if (joinType === "OR-join") {
+          // OR-join: no waiting, no merging — each process passes through its
+          // own incoming arc independently. checkArc returned false only because
+          // a sibling arc with same C was already traversed, but this process
+          // is on a DIFFERENT arc with its own L-attribute. Allow it through.
+          traverseArc({ arcUID }, proc.states, cache);
+          proc.currentVertex = arc.toVertexUID;
+          console.log(`  → OR-join: Process ${proc.id} passed through independently to ${proc.currentVertex}`);
+
+          // PI marker cleanup — see comment in unconstrained branch above.
+          if (proc.interruptedByRBS !== null &&
+              !isVertexInRBS(proc.currentVertex, proc.interruptedByRBS, cache)) {
+            console.log(
+              `  PI: Process ${proc.id} exited RBS (center ${proc.interruptedByRBS}) — clearing PI marker.`
+            );
+            proc.interruptedByRBS = null;
+            proc.interruptedByProcessId = null;
+          }
+
+          // Outbridge traversal resets only EGu arcs (handled in aes.mjs).
+          // Do NOT reset the outbridge arc itself — its L-attribute applies.
+
+          if (proc.currentVertex === sink) {
+            proc.status = "done";
+            results.push({ processId: proc.id, activityProfile: proc.states.activityProfile });
+            console.log(`  → Process ${proc.id} reached sink!`);
+          }
+
+          checkProcessInterruption(processes, proc, arcUID, cache);
+
+        } else {
+          lockProcess(proc);
+          console.log(`  → Process ${proc.id} locked (constrained, no join)`);
+        }
+      }
+    }
+
+    // Resolve pending AND and MIX joins.
+    // Re-check status inside the loop because resolvePendingProcesses absorbs
+    // partner processes and flips their status from "pending" to "locked"
+    // mid-iteration. The snapshot taken by .filter() still includes those
+    // absorbed processes, and without a re-check the stranded fallback would
+    // run on a process that has already been merged into its survivor.
+    for (const proc of processes.filter((p) => p.status === "pending")) {
+      if (proc.status !== "pending") continue;
+      if (!proc.pendingArcUID) continue;
+      const pendingArc = cache.arcMap[proc.pendingArcUID];
+      if (!pendingArc) continue;
+
+      const joinType = getJoinType(pendingArc.toVertexUID, cache, processes, proc);
+      if (joinType === "AND-join" || joinType === "MIX-AND-join" || joinType === "MIX-OR-join") {
+        const resolved = resolvePendingProcesses(
+          processes,
+          pendingArc.toVertexUID,
+          cache,
+          idCounter,
+        );
+        if (resolved) {
+          console.log(`Resolved join at vertex ${pendingArc.toVertexUID}`);
+        } else {
+          // Check if stranded — for every OTHER incoming arc, no live process
+          // can still arrive on it. A process counts as "live" if it is pending
+          // on that arc, or if it is active and its currentVertex can still
+          // forward-reach the source of that arc through the graph.
+          //
+          // The previous version of this check only looked at processes
+          // already pending on the partner arc, which fired the fallback the
+          // moment the partner process was still upstream — breaking AND-joins.
+          const incomingArcs = [...getIncomingArcs(pendingArc.toVertexUID, cache.arcsMatrix)];
+          const isStranded = incomingArcs
+            .filter(uid => uid !== proc.pendingArcUID)
+            .every(uid => !canStillArriveOnArc(uid, processes, cache));
+
+          if (isStranded) {
+            traverseArc({ arcUID: proc.pendingArcUID }, proc.states, cache);
+            proc.currentVertex = pendingArc.toVertexUID;
+            proc.status = "active";
+            proc.pendingArcUID = null;
+            console.log(`  Process ${proc.id} unblocked (stranded — no merge partner), now at ${proc.currentVertex}`);
+
+            if (proc.currentVertex === sink) {
+              proc.status = "done";
+              results.push({ processId: proc.id, activityProfile: proc.states.activityProfile });
+              console.log(`  → Process ${proc.id} reached sink (stranded fallback)!`);
+            }
+          }
+        }
+      } else if (joinType === "none") {
+        // joinType === "none" for a pending Σ process when all ε arc processes
+        // at a MIX join are already consumed (locked/done). This process can
+        // no longer merge — allow it through independently (MIX-OR fallback).
+        const incomingArcs = [...getIncomingArcs(pendingArc.toVertexUID, cache.arcsMatrix)];
+        const isMixVertex = incomingArcs.length > 1 &&
+          incomingArcs.some(uid => isEpsilon(cache.arcMap[uid])) &&
+          incomingArcs.some(uid => !isEpsilon(cache.arcMap[uid]));
+        const epsArcExhausted = isMixVertex && incomingArcs
+          .filter(uid => isEpsilon(cache.arcMap[uid]))
+          .every(uid => !processes.some(
+            p => (p.status === "pending" || p.status === "active") && p.pendingArcUID === uid
+          ));
+
+        if (epsArcExhausted) {
+          // No ε partner available — pass through independently
+          traverseArc({ arcUID: proc.pendingArcUID }, proc.states, cache);
+          proc.currentVertex = pendingArc.toVertexUID;
+          proc.status = "active";
+          proc.pendingArcUID = null;
+          console.log(
+            `  Process ${proc.id} unblocked (MIX-OR fallback — ε arc exhausted), ` +
+            `now at ${proc.currentVertex}`
+          );
+
+          if (proc.currentVertex === sink) {
+            proc.status = "done";
+            results.push({ processId: proc.id, activityProfile: proc.states.activityProfile });
+            console.log(`  → Process ${proc.id} reached sink via MIX-OR fallback!`);
+          }
+        }
+      }
+    }
+
+    // After arc-based pending resolution, give PI-pending processes a chance
+    // to resume. A process marked interrupted-by-RBS has no specific arc it
+    // is waiting on; it just needs an AND/MIX-join down the line where it
+    // can merge with the interrupting process. If such a join is still
+    // reachable, reactivate; otherwise lock.
+    tryResumeInterruptedProcesses(processes, cache);
+  }
+
+  console.log(
+    "PAE done — processes:",
+    processes.length,
+    "completed:",
+    results.length,
+  );
+  console.log(
+    "Results:",
+    results.map((r) => ({
+      processId: r.processId,
+      steps: Object.entries(r.activityProfile).map(([t, arcs]) => ({
+        timestep: Number(t),
+        arcs: [...arcs],
+      })),
+    })),
+  );
+
+  if (results.length === 0) return null;
+
+  return getTerminationResult(processes, sink, cache, simpleModel, competitionLog);
+}

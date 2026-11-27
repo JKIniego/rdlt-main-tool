@@ -13,6 +13,8 @@ export default class ModellingManager {
     /** @type { ModelContext } */
     context;
 
+    #history = { snapshots: [], index: -1, batchDepth: 0, batchChanged: false };
+
     
     /**
      * @type {{
@@ -58,6 +60,11 @@ export default class ModellingManager {
     }
 
     loadModel() {
+        this.#renderModel();
+        this.#recordHistory();
+    }
+
+    #renderModel() {
         const visualModelManager = this.context.managers.visualModel;
 
         const arcs = visualModelManager.getAllArcs();
@@ -66,6 +73,65 @@ export default class ModellingManager {
         visualModelManager.getAllComponents().map(vertex => this.#displayNewComponent(vertex));
 
         this.#notifyModelStructureChangesListeners();
+    }
+
+    undo() {
+        if(this.#history.index <= 0) return;
+        this.#restoreHistory(this.#history.index - 1);
+    }
+
+    redo() {
+        if(this.#history.index >= this.#history.snapshots.length - 1) return;
+        this.#restoreHistory(this.#history.index + 1);
+    }
+
+    #restoreHistory(index) {
+        this.#history.index = index;
+        const snapshot = JSON.parse(this.#history.snapshots[index]);
+        this.context.managers.visualModel.restoreModel(snapshot);
+
+        this.context.managers.rbsBounds.reset();
+        this.context.managers.drawing.resetModelDrawing();
+        this.modellingStates.selected = { components: [], arcs: [], annotations: [] };
+        this.context.managers.workspace.setModelName(snapshot.name);
+        this.#renderModel();
+        this.#refreshSelected();
+        LocalSessionManager.saveModel(this.context);
+        this.#updateUndoRedoButtons();
+    }
+
+    #recordHistory() {
+        if(this.#history.batchDepth > 0) {
+            this.#history.batchChanged = true;
+            return;
+        }
+
+        const snapshot = JSON.stringify(this.context.managers.visualModel.getModelJSON());
+        if(this.#history.snapshots[this.#history.index] === snapshot) return;
+
+        this.#history.snapshots = this.#history.snapshots.slice(0, this.#history.index + 1);
+        this.#history.snapshots.push(snapshot);
+        this.#history.index = this.#history.snapshots.length - 1;
+        this.#updateUndoRedoButtons();
+    }
+
+    #updateUndoRedoButtons() {
+        this.context.managers.workspace.setUndoRedoState(
+            this.#history.index > 0,
+            this.#history.index < this.#history.snapshots.length - 1
+        );
+    }
+
+    #beginHistoryBatch() {
+        this.#history.batchDepth++;
+    }
+
+    #endHistoryBatch() {
+        this.#history.batchDepth--;
+        if(this.#history.batchDepth === 0 && this.#history.batchChanged) {
+            this.#history.batchChanged = false;
+            this.#recordHistory();
+        }
     }
 
     /**
@@ -163,7 +229,7 @@ export default class ModellingManager {
     }
 
     /**
-     * @param {"mouse-move" | "mouse-down" | "mouse-up" | "key-delete" | "key-selectall" | "key-arrowdown" | "key-arrowup" | "key-arrowleft" | "key-arrowright"} event 
+     * @param {"mouse-move" | "mouse-down" | "mouse-up" | "key-delete" | "key-selectall" | "key-arrowdown" | "key-arrowup" | "key-arrowleft" | "key-arrowright" | "key-undo" | "key-redo"} event 
      * @param {{ x?: number, y?: number }} props 
      */
     onDrawingViewUserEvent(event, props = {}) {
@@ -249,6 +315,12 @@ export default class ModellingManager {
                         break;
                     case "key-cut":
                         this.#cutSelected();
+                        break;
+                    case "key-undo":
+                        this.undo();
+                        break;
+                    case "key-redo":
+                        this.redo();
                         break;
                 }
             break;
@@ -507,7 +579,13 @@ export default class ModellingManager {
      * 
      * @param {{ [id: number]: { x, y } }} newPositions 
      */
-    updateComponentsPositions(newPositions) {
+    updateComponentsPositions(newPositions, recordHistory = true) {
+        const previousPositions = new Map();
+        for(const componentUID in newPositions) {
+            const component = this.getComponentById(Number(componentUID));
+            if(component) previousPositions.set(Number(componentUID), { ...component.geometry.position });
+        }
+
         for(const componentUID in newPositions) {
             const { x, y } = newPositions[componentUID];
             this.#updateComponentPosition(Number(componentUID), x, y);
@@ -517,6 +595,11 @@ export default class ModellingManager {
         const movedComponentsUIDs = Object.keys(newPositions).map(n => Number(n));
         const rbsBounds = this.context.managers.rbsBounds.onComponentsTransformed(movedComponentsUIDs);
         this.context.managers.drawing.updateMultipleRBSBounds(rbsBounds);
+
+        if(recordHistory && [...previousPositions].some(([id, position]) => {
+            const current = this.getComponentById(id)?.geometry.position;
+            return current && (current.x !== position.x || current.y !== position.y);
+        })) this.#saveModel();
     }
 
     #updateComponentPosition(id, x, y) {
@@ -776,15 +859,25 @@ export default class ModellingManager {
         const arcs = this.context.managers.visualModel.getAllArcs();
         const vertices = this.context.managers.visualModel.getAllComponents();
 
+        let modelIsValid = true;
+
         for(const arc of arcs) {
             const { valid, error } = this.validateArc(arc);
-            if(!valid) drawingManager.highlightArc(arc.uid);
+            if(!valid) {
+                drawingManager.highlightArc(arc.uid);
+                modelIsValid = false;
+            }
         }
 
         for(const vertex of vertices) {
             const { valid, error } = this.validateVertex(vertex);
-            if(!valid) drawingManager.highlightVertex(vertex.uid);
+            if(!valid) {
+                drawingManager.highlightVertex(vertex.uid);
+                modelIsValid = false;
+            }
         }
+
+        this.context.managers.workspace.setModelIsValid(modelIsValid);
     }
 
     /**
@@ -853,48 +946,53 @@ export default class ModellingManager {
         const copiedVertexUID = {};
 
         
-        this.#clearSelection();
+        this.#beginHistoryBatch();
+        try {
+            this.#clearSelection();
 
-        for(const { uid, type, identifier, label, isRBSCenter, geometry, styles } of vertices) {
-            const copiedGeometry = geometry.copy();
-            copiedGeometry.position.x += copyOffset.x;
-            copiedGeometry.position.y += copyOffset.y;
+            for(const { uid, type, identifier, label, isRBSCenter, geometry, styles } of vertices) {
+                const copiedGeometry = geometry.copy();
+                copiedGeometry.position.x += copyOffset.x;
+                copiedGeometry.position.y += copyOffset.y;
 
-            const copiedStyles = styles.copy();
+                const copiedStyles = styles.copy();
 
-            const newComponent = this.addComponent(
-                type, { identifier, label, isRBSCenter },
-                copiedGeometry, copiedStyles
-            );
+                const newComponent = this.addComponent(
+                    type, { identifier, label, isRBSCenter },
+                    copiedGeometry, copiedStyles
+                );
 
-            copiedVertexUID[uid] = newComponent.uid;
-            this.#addComponentToSelection(newComponent.uid);
-        }
-
-        for(const { C, L, fromVertexUID, toVertexUID, geometry, styles } of arcs) {
-            const copiedGeometry = geometry.copy();
-            for(const waypoint of copiedGeometry.waypoints) {
-                waypoint.x += copyOffset.x;
-                waypoint.y += copyOffset.y;
+                copiedVertexUID[uid] = newComponent.uid;
+                this.#addComponentToSelection(newComponent.uid);
             }
 
-            const copiedStyles = styles.copy();
+            for(const { C, L, fromVertexUID, toVertexUID, geometry, styles } of arcs) {
+                const copiedGeometry = geometry.copy();
+                for(const waypoint of copiedGeometry.waypoints) {
+                    waypoint.x += copyOffset.x;
+                    waypoint.y += copyOffset.y;
+                }
 
-            const newArc = this.addArc(
-                copiedVertexUID[fromVertexUID] || fromVertexUID, 
-                copiedVertexUID[toVertexUID] || toVertexUID, 
-                { C, L },
-                copiedGeometry, copiedStyles
-            );
-            
-            this.#addArcToSelection(newArc.uid);
+                const copiedStyles = styles.copy();
+
+                const newArc = this.addArc(
+                    copiedVertexUID[fromVertexUID] || fromVertexUID,
+                    copiedVertexUID[toVertexUID] || toVertexUID,
+                    { C, L },
+                    copiedGeometry, copiedStyles
+                );
+
+                this.#addArcToSelection(newArc.uid);
+            }
+
+            this.#refreshSelected();
+        } finally {
+            this.#endHistoryBatch();
         }
-
-        this.#refreshSelected();
-
     }
 
     #saveModel() {
+        this.#recordHistory();
         LocalSessionManager.saveModel(this.context);
     }
 }

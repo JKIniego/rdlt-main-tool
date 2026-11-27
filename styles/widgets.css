@@ -408,3 +408,47 @@ table.subtable tr {
     background-image: url(../assets/icons/arc.svg);
     background-size: 18px auto;
 }
+
+
+.invalid .requires-valid-model {
+    opacity: 0.4;
+    box-shadow: none;
+    pointer-events: none;
+}
+
+.drawing::after {
+    content: ' ';
+    position: absolute;
+    height: 100%;
+    width: 100%;
+    /* z-index: -1; */
+    pointer-events: none;
+    transition: opacity 100ms ease;
+    box-sizing: border-box;
+    
+    opacity: 0;
+    border: rgba(255, 0, 0, 0.2) 7px solid;
+}
+
+.invalid .drawing::after {
+    opacity: 1;
+}
+
+.result-chip {
+    display: inline-block;
+    vertical-align: middle;
+    padding: 4px 4px;
+    border-radius: 4px;
+    margin: 2px 2px;
+    font-weight: bold;
+}
+
+.result-chip.pass {
+    background-color: #E6FFDB;
+    color: #1F981C;
+}
+
+.result-chip.fail {
+    background-color: #FFE7E2;
+    color: #B21313;
+}

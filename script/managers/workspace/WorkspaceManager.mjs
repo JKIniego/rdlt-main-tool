@@ -186,6 +186,13 @@ export default class WorkspaceManager {
                 new TraversalTreeViewerManager(this.context, snapshot);
             break;
 
+            case "fit-to-view":
+                const geometries = this.context.managers.visualModel
+                    .getAllComponents()
+                    .map(component => component.geometry);
+                this.context.managers.drawing.fitToView(geometries);
+            break;
+
             
         }
     }

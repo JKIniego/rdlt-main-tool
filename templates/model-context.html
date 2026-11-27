@@ -483,6 +483,21 @@
                                     </div>
                                 </main>
                             </div>
+                            <div class="collapsible" data-section-id="sep">
+                                <header>Separability</header>
+                                <main>
+                                    <div class="section-description">
+                                        Verify whether the input RDLT is separable or not.
+                                    </div>
+                                    <div class="input-group checkbox-item">
+                                        <input type="checkbox" name="simulate">
+                                        <label>Include composite activity simulation</label>
+                                    </div>
+                                    <div class="section-action-buttons">
+                                        <button data-subaction="start" class="requires-valid-model"><i class="fas fa-circle-check"></i>&nbsp; Verify Separability</button>
+                                    </div>
+                                </main>
+                            </div>
                             <div class="collapsible" data-section-id="impedance-freeness">
                                 <header>Impedance-Freeness</header>
                                 <main>
@@ -540,36 +555,6 @@
                                             <option value="SDPCS">Σ-distinct PCS</option>
                                         </select> -->
                                         <button data-subaction="start" class="requires-valid-model">Start</button>
-                                    </div>
-                                </main>
-                            </div>
-                            <div class="collapsible" data-section-id="wh">
-                                <header>Well Handledness</header>
-                                <main>
-                                    <div class="section-description">
-                                        Verify the input RDLT whether it is well-handled or otherwise.
-                                    </div>
-                                    <div class="input-group columns full-width">
-                                        <div>
-                                            <label>Source</label>
-                                            <div style="display: flex; gap: 6px;">
-                                                <select name="source" style="flex: 1"></select>
-                                                <button><i class="fas fa-hand"></i></button>
-                                            </div>
-                                        </div>
-                                        <div>
-                                            <label>Sink</label>
-                                            <div style="display: flex; gap: 6px;">
-                                                <select name="sink" style="flex: 1"></select>
-                                                <button><i class="fas fa-hand"></i></button>
-                                            </div>
-                                        </div>
-                                    </div>
-                                    <div>
-                                        <!-- <select name="type">
-                                            <option value="SDPCS">Σ-distinct PCS</option>
-                                        </select> -->
-                                        <button data-subaction="start">Start</button>
                                     </div>
                                 </main>
                             </div>

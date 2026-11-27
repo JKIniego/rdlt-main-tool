@@ -235,6 +235,14 @@ svg .arc-waypoint:not([data-nomove]) {
   stroke: #ff5050;
 }
 
+.ver-subworkspace .sim-svg .arc.active .arc-highlight {
+  stroke: #3a81de;
+}
+
+.ver-subworkspace .sim-svg .arc.active.impedance .arc-highlight {
+  stroke: #ff5050;
+}
+
 /* Green highlight when showing the Shared Arc (lazy sound witness) */
 .ver-subworkspace[data-ver-highlight="shared"] .arc.active .arc-highlight {
   stroke: #4caf50;
@@ -244,7 +252,8 @@ svg .arc-waypoint:not([data-nomove]) {
   stroke: #4caf50;
 }
 
-.vs-subworkspace .arc.abstract .arc-bare {
+.vs-subworkspace .arc.abstract .arc-bare,
+.ver-subworkspace .arc.abstract .arc-bare {
   opacity: 0.2;
 }
 

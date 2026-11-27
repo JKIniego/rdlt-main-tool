@@ -270,6 +270,28 @@ export class BaseModelDrawingManager {
 
     
 
+    /**
+     * Fit the viewport to show all given geometries.
+     * Each geometry must have { position: { x, y }, size? }.
+     * @param {{ position: { x: number, y: number }, size?: number }[]} geometries
+     * @param {number} [padding=40]
+     */
+    fitToView(geometries, padding = 40) {
+        if (!geometries || geometries.length === 0) return;
+
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const g of geometries) {
+            const r = (g.size ?? 0) / 2;
+            minX = Math.min(minX, g.position.x - r);
+            minY = Math.min(minY, g.position.y - r);
+            maxX = Math.max(maxX, g.position.x + r);
+            maxY = Math.max(maxY, g.position.y + r);
+        }
+
+        if (!isFinite(minX)) return;
+        this.viewport.fitToContent({ minX, minY, maxX, maxY }, padding);
+    }
+
     highlightVertex(vertexUID) {
         const vertexBuilder = this.builders.vertices[vertexUID];
         if(!vertexBuilder) return;
@@ -277,7 +299,7 @@ export class BaseModelDrawingManager {
         vertexBuilder.element.classList.add("active");
         this.#highlights.vertices.add(vertexUID);
     }
-
+  
     // highlightArc(arcUID) {
     //     const arcBuilder = this.builders.arcs[arcUID];
     //     if(!arcBuilder) return;
@@ -304,11 +326,12 @@ export class BaseModelDrawingManager {
     //     this.#highlights.vertices.clear();
     //     this.#highlights.arcs.clear();
     // }
-    highlightArc(arcUID, color = null) {
+    highlightArc(arcUID, color = null, impedance = false) {
         const arcBuilder = this.builders.arcs[arcUID];
         if(!arcBuilder) return;
 
         arcBuilder.element.classList.add("active");
+        if (impedance) arcBuilder.element.classList.add("impedance");
 
         if(color) {
             const highlightEl = arcBuilder.element.querySelector(".arc-highlight");
@@ -328,7 +351,8 @@ export class BaseModelDrawingManager {
         for(const highlightedArcUID of this.#highlights.arcs) {
             const arcBuilder = this.builders.arcs[highlightedArcUID];
             if(!arcBuilder) continue;
-            arcBuilder.element.classList.remove("active");
+
+            arcBuilder.element.classList.remove("active", "impedance");
             // Also remove inline color so CSS default takes over next time
             const highlightEl = arcBuilder.element.querySelector(".arc-highlight");
             if(highlightEl) highlightEl.style.stroke = "";

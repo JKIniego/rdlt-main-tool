@@ -127,6 +127,8 @@ export class VERSubworkspaceManager {
       const selectedIndex = Number(instanceSelector.value);
       this.#verManager.displayInstanceResult(selectedIndex);
     });
+
+    // Initialize MAS/CAS section refs removed - not used
   }
 
   #onActionClicked(action) {
@@ -211,5 +213,8 @@ export class VERSubworkspaceManager {
 
   getSimulationSVG() {
     return this.#view.simulationSVG;
+  
+  getRootElement() {
+    return this.#rootAreaElement;
   }
 }

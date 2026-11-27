@@ -22,9 +22,21 @@ export default class VERResultTabManager {
    *       title: HTMLDivElement,
    *       description: HTMLDivElement,
    *   },
+   *   runtime: {
+   *       section: HTMLDivElement,
+   *       value: HTMLDivElement,
+   *   },
    *   criteria: {
    *      section: HTMLDivElement,
    *      table: HTMLTableElement,
+   *   },
+   *   kmaxEnsuring: {
+   *      section: HTMLDivElement,
+   *      table: HTMLTableElement,
+   *   },
+   *   theoreticalNotes: {
+   *      section: HTMLDivElement,
+   *      content: HTMLDivElement,
    *   },
    *   violatingArcs: {
    *      section: HTMLDivElement,
@@ -40,7 +52,10 @@ export default class VERResultTabManager {
     masInfo: null,
     subsectionsContainer: null,
     conclusion: { root: null, title: null, description: null },
+    runtime: { section: null, value: null },
     criteria: { section: null, table: null },
+    kmaxEnsuring: { section: null, table: null },
+    theoreticalNotes: { section: null, content: null },
     violatingArcs: { section: null, table: null },
     violatingVertices: { section: null, table: null },
   };
@@ -63,6 +78,35 @@ export default class VERResultTabManager {
     this.#view.subsectionsContainer = this.#rootElement.querySelector(
       `[data-ver-section="subsections"]`
     );
+    const kmaxCheckButton = this.#rootElement.querySelector(
+      "button[data-subaction='check-kmax']",
+    );
+    if (this.#parentManager.canCheckKmax) {
+      kmaxCheckButton.classList.remove("hidden");
+      kmaxCheckButton.addEventListener("click", () => {
+        kmaxCheckButton.disabled = true;
+        try {
+          this.#parentManager.checkKmax();
+        } finally {
+          kmaxCheckButton.disabled = false;
+        }
+      });
+    }
+
+    const kmaxPAEButton = this.#rootElement.querySelector(
+      "button[data-subaction='simulate-kmax-pae']",
+    );
+    if (this.#parentManager.canSimulateKmaxPAE) {
+      kmaxPAEButton.classList.remove("hidden");
+      kmaxPAEButton.addEventListener("click", async () => {
+        kmaxPAEButton.disabled = true;
+        try {
+          await this.#parentManager.simulateKmaxPAE();
+        } finally {
+          kmaxPAEButton.disabled = false;
+        }
+      });
+    }
 
     this.#view.conclusion.root =
       this.#rootElement.querySelector(".status-chip");
@@ -72,11 +116,30 @@ export default class VERResultTabManager {
       ".status-description"
     );
 
+    this.#view.runtime.section = this.#rootElement.querySelector(
+      `[data-ver-section="runtime"]`
+    );
+    this.#view.runtime.value = this.#rootElement.querySelector(
+      `[data-ver-section="runtime"] .runtime-value`
+    );
+
     this.#view.criteria.section = this.#rootElement.querySelector(
       `[data-ver-section="criteria"]`
     );
     this.#view.criteria.table = this.#rootElement.querySelector(
       `[data-ver-section="criteria"] table`
+    );
+    this.#view.kmaxEnsuring.section = this.#rootElement.querySelector(
+      `[data-ver-section="kmax-ensuring"]`
+    );
+    this.#view.kmaxEnsuring.table = this.#rootElement.querySelector(
+      `[data-ver-section="kmax-ensuring"] table`
+    );
+    this.#view.theoreticalNotes.section = this.#rootElement.querySelector(
+      `[data-ver-section="theoretical-notes"]`
+    );
+    this.#view.theoreticalNotes.content = this.#rootElement.querySelector(
+      `[data-ver-section="theoretical-notes"] .theoretical-notes-content`
     );
     this.#view.violatingVertices.section = this.#rootElement.querySelector(
       `[data-ver-section="v-vertices"]`
@@ -102,6 +165,7 @@ export default class VERResultTabManager {
    *              title,
    *              description
    *          },
+   *          runtimeMs?: number,
    *          criteria: {
    *              pass, description
    *          }[],
@@ -125,9 +189,16 @@ export default class VERResultTabManager {
 
     const {
       name,
-      evaluation: { conclusion, criteria, violating, violatingRemarks },
+      evaluation: {
+        conclusion,
+        runtimeMs,
+        criteria,
+        kmax,
+        kmaxEnsuringResults: kmaxEnsuring,
+        violating,
+        violatingRemarks,
+      },
     } = instance;
-
     // Setup conclusion chip
     if (conclusion.pass) {
       this.#view.conclusion.root.classList.add("passed");
@@ -137,6 +208,17 @@ export default class VERResultTabManager {
 
     this.#view.conclusion.title.innerHTML = conclusion.title;
     this.#view.conclusion.description.innerHTML = conclusion.description;
+    
+    if (Number.isFinite(runtimeMs)) {
+      this.#view.runtime.section.classList.remove("hidden");
+      const runtimeText = runtimeMs >= 1000
+        ? `${(runtimeMs / 1000).toFixed(2)} s`
+        : `${runtimeMs.toFixed(1)} ms`;
+      this.#view.runtime.value.textContent = runtimeText;
+    } else {
+      this.#view.runtime.section.classList.add("hidden");
+      this.#view.runtime.value.textContent = "--";
+    }
 
     // If the instance has subsections, render each as its own collapsible
     // and collect all violating arcs across subsections into the shared v-arcs section.
@@ -182,8 +264,29 @@ export default class VERResultTabManager {
       criteriaSection.classList.add("hidden");
     }
 
+    // Setup theoretical notes
+    const theoreticalNotesSection = this.#view.theoreticalNotes.section;
+    const theoreticalNotesContent = this.#view.theoreticalNotes.content;
+    theoreticalNotesContent.innerHTML = "";
+    
+    // Check if this instance has theoretical notes (added by soundness-service for lazy soundness)
+    const theoreticalNote = instance.evaluation?.theoreticalNote;
+    if (theoreticalNote) {
+      theoreticalNotesSection.classList.remove("hidden");
+      
+      const noteElement = buildElement("div", { classname: "theoretical-note" }, [
+        buildElement("div", { classname: "note-theorem" }, [theoreticalNote.theorem]),
+        buildElement("div", { classname: "note-statement" }, [theoreticalNote.statement]),
+        buildElement("div", { classname: "note-explanation" }, [theoreticalNote.explanation])
+      ]);
+      
+      theoreticalNotesContent.appendChild(noteElement);
+    } else {
+      theoreticalNotesSection.classList.add("hidden");
+    }
+
     // Setup violating arcs
-    this.#renderViolatingArcs(violating?.arcs ?? [], violatingRemarks);
+    this.#renderViolatingArcs(violating?.arcs ?? [], violatingRemarks, name);
 
     // Setup violating vertices
     const violatingVerticesSection = this.#view.violatingVertices.section;
@@ -204,6 +307,91 @@ export default class VERResultTabManager {
       }
     } else {
       violatingVerticesSection.classList.add("hidden");
+    }
+
+    // Setup kmax-ensuring report
+    const kmaxEnsuringSection = this.#view.kmaxEnsuring.section;
+    const kmaxEnsuringTableBody =
+      this.#view.kmaxEnsuring.table.querySelector("tbody");
+    kmaxEnsuringTableBody.innerHTML = "";
+
+    // Check if this instance has kmax-ensuring notes (added by soundness-service for kmax-soundness)
+    if (this.#parentManager.canShowKmaxEnsuringResults) {
+      kmaxEnsuringSection.classList.remove("hidden");
+      const formatCalculation = (value) =>
+        Number.isFinite(value) ? String(value) : "-";
+      const buildResultChip = (passed) =>
+        buildElement("span", { classname: "result-chip " + (passed ? "pass" : "fail") }, [
+          passed ? "Pass" : "Fail",
+        ]);
+      if (!kmaxEnsuring?.length) {
+        kmaxEnsuringTableBody.appendChild(buildElement("tr", {}, [
+          buildElement("td", {}, ["No RDLT kᵐᵃˣ-ensuring results available"]),
+        ]));
+      }
+
+      for (const splitJoin of kmaxEnsuring || []) {
+        const expectedJm = splitJoin.expectedMergingJoins;
+        const expectedJs = splitJoin.maxSeparatingJoins;
+        const jmFormula = Number.isFinite(splitJoin.esplits) && Number.isFinite(kmax)
+          ? `ceil(${splitJoin.esplits} / 2) - ${kmax} + 1 = ${formatCalculation(expectedJm)}`
+          : formatCalculation(expectedJm);
+        const jsFormula = Number.isFinite(kmax)
+          ? `${kmax} - 1 = ${formatCalculation(expectedJs)}`
+          : formatCalculation(expectedJs);
+        const mergingPass = Number.isFinite(splitJoin.mergingJoins) &&
+          Number.isFinite(expectedJm) &&
+          splitJoin.mergingJoins === expectedJm;
+        const separatingPass = Number.isFinite(splitJoin.separatingJoins) &&
+          Number.isFinite(expectedJs) &&
+          splitJoin.separatingJoins <= expectedJs;
+        const pairDetails = [
+          [
+            `Eₛₚₗᵢₜ (${formatCalculation(splitJoin.esplits)})`,
+            buildElement("div", {}, [
+              ...(splitJoin.esplitArcs || []).map(([from, to]) =>
+                buildArcTagElement(from, to),
+              ),
+            ]),
+          ],
+          [
+            "Merging joins (Jₘ)",
+            [
+              `${formatCalculation(splitJoin.mergingJoins)} counted; expected ${formatCalculation(expectedJm)} (${jmFormula}) - `,
+              buildResultChip(mergingPass),
+            ],
+          ],
+          [
+            "Separating joins (Jₛ)",
+            [
+              `${formatCalculation(splitJoin.separatingJoins)} counted; maximum ${formatCalculation(expectedJs)} (${jsFormula}) - `,
+              buildResultChip(separatingPass),
+            ],
+          ],
+        ];
+        const detailsTable = buildElement("table", {}, [
+          buildElement("tbody", {}, pairDetails.map(([label, value]) =>
+            buildElement("tr", {}, [
+              buildElement("th", {}, [label]),
+              buildElement("td", {}, Array.isArray(value) ? value : [value]),
+            ]),
+          )),
+        ]);
+        const pairResult = splitJoin.pass ? "Satisfied" : "Not satisfied";
+        const pairSummary = buildElement("div", { classname: "vertex-tag" }, [
+          buildElement("span", {}, [`L${splitJoin.level} `]),
+          buildElement("span", {}, [` - kᵐᵃˣ-ensuring: ${pairResult}`]),
+        ]);
+        if (splitJoin.reason) {
+          pairSummary.append(buildElement("div", {}, [splitJoin.reason]));
+        }
+
+        kmaxEnsuringTableBody.appendChild(buildElement("tr", {}, [
+          buildElement("td", { colspan: "2" }, [pairSummary, detailsTable]),
+        ]));
+      }
+    } else {
+      kmaxEnsuringSection.classList.add("hidden");
     }
   }
 
@@ -294,10 +482,16 @@ export default class VERResultTabManager {
     );
   }
 
-  #renderViolatingArcs(arcUIDs, violatingRemarks) {
+  #renderViolatingArcs(arcUIDs, violatingRemarks = null, name = null) {
     const section = this.#view.violatingArcs.section;
     const table   = this.#view.violatingArcs.table;
     table.innerHTML = "";
+    
+    // Dynamic header: "Shared Arc" instance shows "Shared Arc", all others show "Violating Arcs"
+    const header = section.querySelector("header");
+    if (header) {
+      header.textContent = name === "Shared Arc" ? "Shared Arc" : "Violating Arcs";
+    }
 
     if (!arcUIDs || arcUIDs.length === 0) {
       section.classList.add("hidden");

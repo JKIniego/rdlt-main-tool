@@ -18,7 +18,16 @@ export function startURLDownload(filename, url) {
 }
 
 export function sanitizeForFilename(str) {
-    return str.replace(/[^A-Za-z0-9_\-]+/g, "").trim();
+    const filename = str
+        .replace(/[<>:"\/\\|?*\u0000-\u001F]/g, "")
+        .trim()
+        .replace(/[. ]+$/g, "");
+
+    if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(filename)) {
+        return `_${filename}`;
+    }
+
+    return filename || "Untitled";
 }
 
 /**

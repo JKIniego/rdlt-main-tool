@@ -429,3 +429,22 @@ table.subtable tr {
 .invalid .drawing::after {
     opacity: 1;
 }
+
+.result-chip {
+    display: inline-block;
+    vertical-align: middle;
+    padding: 4px 4px;
+    border-radius: 4px;
+    margin: 2px 2px;
+    font-weight: bold;
+}
+
+.result-chip.pass {
+    background-color: #E6FFDB;
+    color: #1F981C;
+}
+
+.result-chip.fail {
+    background-color: #FFE7E2;
+    color: #B21313;
+}

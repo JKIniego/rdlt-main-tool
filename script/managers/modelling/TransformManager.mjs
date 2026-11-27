@@ -74,7 +74,7 @@ export default class TransformManager {
             newPositions[id] = { x: nx, y: ny };
         }
 
-        this.context.managers.modelling.updateComponentsPositions(newPositions);
+        this.context.managers.modelling.updateComponentsPositions(newPositions, false);
     }
 
     endMovement() {

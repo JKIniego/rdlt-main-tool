@@ -15,7 +15,6 @@
                 </section>
             </main>
             <div id="myModal" class="modal hidden">
-
                 <!-- Modal content -->
                <div class="modal-content">
                    <div class="modal-header">
@@ -25,10 +24,9 @@
                    <div class="modal-body">
                    </div>
                    <div class="modal-footer">
-                   <button class="close-modal">Close</button> <!-- Added close button -->
+                   <button class="close-modal">Close</button>
                    </div>
                </div> 
-           
            </div>
         </main>
         <aside class="right-panels">
@@ -44,12 +42,24 @@
                         <div class="status-title">Some title</div>
                         <div class="status-description">Some description</div>
                     </div>
+                    <div class="collapsible hidden" data-ver-section="runtime">
+                        <header>Runtime</header>
+                        <main>
+                            <div class="runtime-value">--</div>
+                        </main>
+                    </div>
                     <div class="collapsible" data-ver-section="criteria">
                         <header>Criteria</header>
                         <main>
                             <table>
                                 <tbody></tbody>
                             </table>
+                        </main>
+                    </div>
+                    <div class="collapsible" data-ver-section="theoretical-notes">
+                        <header>Theoretical Notes</header>
+                        <main>
+                            <div class="theoretical-notes-content"></div>
                         </main>
                     </div> 
                     <div class="collapsible" data-ver-section="v-arcs">
@@ -75,6 +85,16 @@
                             </table>
                         </main>
                     </div>
+                    <div class="collapsible hidden" data-ver-section="kmax-ensuring">
+                        <header>kᵐᵃˣ-ensuring Report</header>
+                        <main>
+                            <table>
+                                <tbody></tbody>
+                            </table>
+                        </main>
+                    </div>
+                    <button data-subaction="check-kmax" class="hidden">kᵐᵃˣ Check</button>
+                    <button data-subaction="simulate-kmax-pae" class="hidden">Simulate PAE</button>
                     <button data-subaction="simulate-mae">Simulate</button>
                 </div>
             </main>

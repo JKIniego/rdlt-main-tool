@@ -5,6 +5,8 @@ import { BaseModelDrawingManager } from "../drawing/BaseModelDrawingManager.mjs"
 import ModelContext from "../model/ModelContext.mjs";
 import VERResultTabManager from "./panels/VERResultTabManager.mjs";
 import { VERSubworkspaceManager } from "./VERSubworkspaceManager.mjs";
+import { PAESimulationManager } from "../activity/extraction/PAESimulationManager.mjs";
+import { verifySoundness } from "../../services/soundness/soundness-service.mjs";
 
 export class VerificationsResultManager {
   /** @type {ModelContext} */
@@ -30,9 +32,28 @@ export class VerificationsResultManager {
    *                  pass: boolean,
    *                  description: string
    *              }[],
+   *              kmax?: number,
+   *              kmaxEnsuringResults?: {
+   *                  level: number,
+   *                  scope?: string,
+   *                  pair?: string,
+   *                  pass: boolean,
+   *                  vertices?: VertexUID[],
+   *                  esplits?: number,
+   *                  esplitArcs?: [string, string][],
+   *                  mergingJoins?: number,
+   *                  expectedMergingJoins?: number,
+   *                  separatingJoins?: number,
+   *                  maxSeparatingJoins?: number,
+   *                  reason?: string
+   *              }[],
    *              violating: {
    *                  vertices: VertexUID[],
    *                  arcs: ArcUID[]
+   *              },
+   *              violatingRemarks?: {
+   *                  vertices: { [vertexUID: number]: string },
+   *                  arcs: { [arcUID: number]: string }
    *              },
    *          },
    *          model: {
@@ -48,6 +69,9 @@ export class VerificationsResultManager {
 
   /** @type {VisualRDLTModel} */
   #modelSnapshot;
+
+  /** @type {{ source: number, sink: number, notion: "classical" | "weak" | "kmax" } | null} */
+  #soundnessConfig;
 
   /** @type {VERSubworkspaceManager} */
   #subworkspaceManager;
@@ -69,12 +93,19 @@ export class VerificationsResultManager {
    * @param {VerificationResultData} result
    * @param {*} visualModelSnapshot
    */
-  constructor(context, result, visualModelSnapshot, activityProfile = null) {
+  constructor(
+    context,
+    result,
+    visualModelSnapshot,
+    activityProfile = null,
+    soundnessConfig = null,
+  ) {
     this.context = context;
     this.id = generateUniqueID();
     this.result = result;
     this.#modelSnapshot = visualModelSnapshot;
     this.activityProfile = activityProfile;
+    this.#soundnessConfig = soundnessConfig;
 
     this.#initialize();
   }
@@ -118,7 +149,7 @@ export class VerificationsResultManager {
         ? allArcs.filter((v) => instance.model?.arcs.includes(v.uid))
         : allArcs;
 
-      drawingManager.setupComponents(vertices, arcs);
+      drawingManager.setupComponents(vertices, arcs, instance.options);
 
       // Highlight violating arcs
       const violatingArcsUIDs = instance.evaluation?.violating?.arcs || [];
@@ -137,6 +168,87 @@ export class VerificationsResultManager {
     }
 
     this.displayInstanceResult(0);
+  }
+
+  get canSimulateKmaxPAE() {
+    return this.#soundnessConfig?.notion === "kmax"
+      && this.result.instances[0]?.evaluation?.criteria?.[0]?.pass !== false;
+  }
+
+  get canShowKmaxEnsuringResults() {
+    return this.#soundnessConfig?.notion === "kmax"
+      && this.result.instances[0]?.evaluation?.criteria?.[0]?.pass === true;
+  }
+
+  get canCheckKmax() {
+    return ["classical", "weak"].includes(this.#soundnessConfig?.notion)
+      && this.result.instances[0]?.evaluation?.conclusion?.pass === true
+      && this.result.instances[0]?.evaluation?.theoreticalNote != null;
+  }
+
+  checkKmax() {
+    if (!this.canCheckKmax || !this.#soundnessConfig) return;
+
+    const { source, sink } = this.#soundnessConfig;
+    const result = verifySoundness(
+      this.#modelSnapshot.toSimpleModel(),
+      source,
+      sink,
+      "kmax",
+    );
+    result.title = "kᵐᵃˣ Soundness Verification";
+    this.context.managers.workspace.showVerificationResults(
+      result,
+      this.#modelSnapshot,
+      null,
+      { source, sink, notion: "kmax" },
+    );
+  }
+
+  async simulateKmaxPAE() {
+    if (!this.#soundnessConfig) return;
+
+    const { source, sink } = this.#soundnessConfig;
+    const paeManager = new PAESimulationManager(
+      this.context,
+      { name: "kmax-soundness PAE", source, sink },
+      this.#modelSnapshot,
+    );
+    await paeManager.ready;
+
+    const conclusion = paeManager.getConclusion();
+    const competingArcUIDs = [...paeManager.getCompetingArcUIDs()];
+    const interruptingArcUIDs = [...paeManager.getInterruptingArcUIDs()];
+    const entries = paeManager.isParallel
+      ? paeManager.getProcessEntriesForGroup(0)
+      : paeManager.getProcessEntries();
+
+    if (entries.length === 0) {
+      alert(`PAE could not produce any activities.\n\n${conclusion.title}: ${conclusion.description}`);
+      return;
+    }
+
+    const parallelGroupId = crypto.randomUUID();
+    const activities = entries.map((entry, index) => new Activity({
+      name: entries.length === 1
+        ? "kmax-soundness PAE"
+        : `kmax-soundness PAE — Process ${index + 1}`,
+      source,
+      sink,
+      origin: "pae",
+      parallelGroupId,
+      conclusion,
+      profile: entry.activityProfile,
+      tor: {},
+      competingArcUIDs,
+      interruptingArcUIDs,
+    }));
+
+    if (activities.length > 1) {
+      this.context.managers.workspace.startParallelActivitySimulation(activities);
+    } else {
+      this.context.managers.workspace.startActivitySimulation(activities[0]);
+    }
   }
 
   getVertexIdentifier(vertexUID) {
@@ -170,9 +282,18 @@ export class VerificationsResultManager {
       .getInstanceSVG(instanceIndex)
       .classList.add("active");
 
+    // Set data attribute for highlight color: green for Shared Arc, red otherwise
+    const root = this.#subworkspaceManager.getRootElement();
+    if (instance.name === "Shared Arc") {
+      root.setAttribute("data-ver-highlight", "shared");
+    } else {
+      root.removeAttribute("data-ver-highlight");
+    }
+
     // Update result tab
     this.#panels.result.displayInstanceResult(instance);
   }
+
   handleSimulateMAE(view) {
     this.context.managers.workspace.startActivitySimulation(new Activity({
       name: "Activity from Well-Handledness",

@@ -46,6 +46,23 @@ export default class Activity {
     /** @type {TimelinessOfResponse} */
     tor;
 
+    /** @type {string | null} */
+    parallelGroupId;
+
+    /** @type {number[]} — arc UIDs that caused competition (PAE only) */
+    competingArcUIDs;
+
+    /** @type {number[]} — arc UIDs that caused process interruption (PAE only) */
+    interruptingArcUIDs;
+
+    /** @type {number[]} — process IDs of activities this one interrupts/is interrupted by */
+    interruptingActivityIds;
+
+    /** @type {number | null} — PAE process ID this activity was derived from
+     *  (for color-registry lookups so the activity-profile UI and the
+     *  traversal-tree share colors). null for non-PAE activities. */
+    paeProcessId;
+
     /**
      * @param {{ 
      *     id: string, 
@@ -55,7 +72,8 @@ export default class Activity {
      *     sink: VertexUID, 
      *     conclusion: ActivityConclusion, 
      *     profile: ActivityProfile,
-     *     tor: TimelinessOfResponse
+     *     tor: TimelinessOfResponse,
+     *     parallelGroupId: string | null
      * }} values 
      */
     constructor(values) {
@@ -67,5 +85,10 @@ export default class Activity {
         this.conclusion = values.conclusion;
         this.profile = values.profile;
         this.tor = values.tor;
+        this.parallelGroupId = values.parallelGroupId || null;
+        this.competingArcUIDs = values.competingArcUIDs || [];
+        this.interruptingArcUIDs    = values.interruptingArcUIDs    ?? [];
+        this.interruptingActivityIds= values.interruptingActivityIds ?? [];
+        this.paeProcessId           = values.paeProcessId           ?? null;
     }
 }

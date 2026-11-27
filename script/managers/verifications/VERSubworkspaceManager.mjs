@@ -213,6 +213,7 @@ export class VERSubworkspaceManager {
 
   getSimulationSVG() {
     return this.#view.simulationSVG;
+  }
   
   getRootElement() {
     return this.#rootAreaElement;

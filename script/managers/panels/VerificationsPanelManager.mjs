@@ -319,9 +319,6 @@ export default class VerificationsPanelManager {
       impedanceFreeness: {},
       soundness: {},
       separability: {},
-    },
-  };
-
       resetSafeness: {},
     },
   };

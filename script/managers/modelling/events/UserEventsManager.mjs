@@ -48,16 +48,21 @@ export default class UserEventsManager {
 
                 modellingManager.onDrawingViewUserEvent(keyUserEvent);
             } else {
-                if(setHasExact(keys, "Control", "a")) {
+                if(setHasExact(keys, "Control", "a") || setHasExact(keys, "Meta", "a")) {
                     modellingManager.onDrawingViewUserEvent("key-selectall");
-                } else if(setHasExact(keys, "Control", "c")) {
+                } else if(setHasExact(keys, "Control", "c") || setHasExact(keys, "Meta", "c")) {
                     modellingManager.onDrawingViewUserEvent("key-copy");
-                } else if(setHasExact(keys, "Control", "v")) {
+                } else if(setHasExact(keys, "Control", "v") || setHasExact(keys, "Meta", "v")) {
                     modellingManager.onDrawingViewUserEvent("key-paste");
-                } else if(setHasExact(keys, "Control", "d")) {
+                } else if(setHasExact(keys, "Control", "d") || setHasExact(keys, "Meta", "d")) {
                     modellingManager.onDrawingViewUserEvent("key-duplicate");
-                } else if(setHasExact(keys, "Control", "x")) {
+                } else if(setHasExact(keys, "Control", "x") || setHasExact(keys, "Meta", "x")) {
                     modellingManager.onDrawingViewUserEvent("key-cut");
+                } else if(setHasExact(keys, "Control", "z") || setHasExact(keys, "Meta", "z")) {
+                    modellingManager.onDrawingViewUserEvent("key-undo");
+                } else if(setHasExact(keys, "Control", "y") ||
+                    setHasExact(keys, "Control", "Shift", "z")) {
+                    modellingManager.onDrawingViewUserEvent("key-redo");
                 }
             }
         });

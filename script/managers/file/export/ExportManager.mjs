@@ -60,7 +60,7 @@ export default class ExportManager {
 
 
         const modelName = this.context.managers.visualModel.getModelName() || "Untitled Model";
-        const filename = modelName.replace(/[^A-z0-9-_]/g, "") + ".png";
+        const filename = sanitizeForFilename(modelName) + ".png";
         const svgElement = this.context.managers.workspace.getDrawingSVG();
         return ImageExportManager.exportSVGToImage(filename, svgElement, { minX, minY, maxX, maxY });
     }

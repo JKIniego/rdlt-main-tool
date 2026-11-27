@@ -14,6 +14,7 @@ import { VerificationsResultManager } from "../verifications/VerificationsResult
 import { VertexSimplificationManager } from "../vsimp/VertexSimplificationManager.mjs";
 import { TabGroupManager } from "../workspace/TabGroupManager.mjs";
 import { TabManager } from "../workspace/TabManager.mjs";
+import TraversalTreeViewerManager from "../parallel/TraversalTreeSubworkspaceManager.mjs";
 
 export default class WorkspaceManager {
     /** @type { ModelContext } */
@@ -155,6 +156,12 @@ export default class WorkspaceManager {
      */
     #onActionClicked(action) {
         switch(action) {
+            case "undo":
+                this.context.managers.modelling.undo();
+            break;
+            case "redo":
+                this.context.managers.modelling.redo();
+            break;
             case "save":
                 this.context.managers.export.exportToRDLTFile();
             break;
@@ -173,7 +180,24 @@ export default class WorkspaceManager {
             case "remove-arc":
                 this.context.managers.modelling.removedSelectedArcs();
             break;
+
+            case "traversal-tree":
+                const snapshot = this.context.managers.visualModel.makeCopy();
+                new TraversalTreeViewerManager(this.context, snapshot);
+            break;
+
+            
         }
+    }
+
+    setUndoRedoState(canUndo, canRedo) {
+        this.#view.buttons.actions.undo.disabled = !canUndo;
+        this.#view.buttons.actions.redo.disabled = !canRedo;
+    }
+
+    setModelName(name) {
+        this.#view.header.modelNameInput.value = name;
+        App.setContextTabTitle(this.context, name);
     }
 
     #setupSubworkspaceTabs() {
@@ -249,6 +273,14 @@ export default class WorkspaceManager {
         }
     }
 
+    setModelIsValid(modelIsValid) {
+        if(modelIsValid) {
+            this.#view.root.classList.remove("invalid");
+        } else {
+            this.#view.root.classList.add("invalid");
+        }
+    }
+
     /**
      * @param {string} id 
      * @param {string} title 
@@ -307,6 +339,10 @@ export default class WorkspaceManager {
         return await this.#addTemplatedSubworkspace(`rdlt2pn-${rdlt2pnID}`, "Convert to Petri Net", "rdlt2pn");
     }
 
+    async addTraversalTreeSubworkspace(ttID) {
+        return await this.#addTemplatedSubworkspace(`tt-${ttID}`, "Traversal Tree", "traversal-tree");
+    }
+
     /** @param {{ name, source, sink, mode, targetedArcs }} configs */
     startAESimulation(configs, visualModel = null) {
         return new AESimulationManager(this.context, configs, 
@@ -321,18 +357,39 @@ export default class WorkspaceManager {
         );
     }
 
-    showVerificationResults(result, visualModel) {
-        return new VerificationsResultManager(this.context, result,
-            visualModel
+    /** @param {Activity[]} activities */
+    startParallelActivitySimulation(activities) {
+        return new ActivitySimulationManager(
+            this.context,
+            activities,  // pass the array instead of a single activity
+            this.context.managers.visualModel.makeCopy()
+        );
+    }
+
+    showVerificationResults(
+        result,
+        visualModel,
+        activityProfile = null,
+        soundnessConfig = null,
+    ) {
+        return new VerificationsResultManager(
+            this.context,
+            result,
+            visualModel,
+                    activityProfile,
+                    soundnessConfig,
         );
     }
 
     /**
      * @param {1 | 2} level 
-     * @returns {VertexSimplificationManager}
+     * @returns {Promise<VertexSimplificationManager>}
      */
-    startVertexSimplification(level, rbsCenterUID = null) {
-        return new VertexSimplificationManager(this.context, level, rbsCenterUID);
+    async startVertexSimplification(level, rbsCenterUID = null) {
+        const vsManager = new VertexSimplificationManager(this.context, level, rbsCenterUID);
+        await vsManager.start();
+
+        return vsManager;
     }
 
     showPOIs(configs) {

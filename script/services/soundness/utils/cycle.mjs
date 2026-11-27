@@ -76,7 +76,8 @@ export class Cycle {
 	}
 	
 	findRByArc(arcStr) {
-		return this.R.find(e => e.arc === arcStr) || null;
+		const arcList = Array.isArray(this.R) ? this.R : this.R.merged;
+		return arcList.find(e => e.arc === arcStr) || null;
 	}
 	
 	findCycles(adj) {
